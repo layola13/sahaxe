@@ -829,6 +829,12 @@ let rec gen_operand ctx e =
 	| TNew (c, _, args) -> gen_new ctx c args
 	| TCall ({ eexpr = TField (obj, FInstance (c, _, cf)) }, args) ->
 		gen_method_call ctx c cf obj args
+	| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, args)
+		when s_type_path c.cl_path = "Math" ->
+		gen_math_call ctx cf args
+	| TField (_, FStatic (c, cf))
+		when s_type_path c.cl_path = "Math" && cf.cf_name = "PI" ->
+		Imm "3.141592653589793"
 	| TField (_, FEnum (_, ef)) ->
 		(* Payload-free enum constructor = its tag index. Payload
 			enums / match extraction are a v0.6 TODO (cf. sala). *)
@@ -1419,6 +1425,62 @@ and string_pair_or_call ctx e =
 		| _ -> None
 	end
 	| _ -> None
+
+(** v0.24b `Math.*` over supplemented `sa_math_*` contracts.
+	`round` lowers to `floor(x + 0.5)` (Haxe semantics, no new ABI). *)
+and gen_math_call ctx cf args =
+	match cf.cf_name, args with
+	| ("floor" | "ceil"), [x] ->
+		let vs = match gen_operand ctx x with
+			| Imm s -> s | Reg r -> r in
+		let f = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = call @sa_math_%s(%s)"
+			f (if cf.cf_name = "floor" then "floor" else "ceil") vs);
+		track ctx f;
+		let r = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = fptosi %s" r f);
+		track ctx r;
+		release_now ctx f;
+		Reg r
+	| "round", [x] ->
+		let vs = match gen_operand ctx x with
+			| Imm s -> s | Reg r -> r in
+		let a = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = fadd %s, 0.5" a vs);
+		track ctx a;
+		let f = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = call @sa_math_floor(%s)" f a);
+		track ctx f;
+		let r = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = fptosi %s" r f);
+		track ctx r;
+		release_now ctx a;
+		release_now ctx f;
+		Reg r
+	| ("sqrt" | "sin" | "cos"), [x] ->
+		let vs = match gen_operand ctx x with
+			| Imm s -> s | Reg r -> r in
+		let r = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = call @sa_math_%s(%s)" r cf.cf_name vs);
+		track ctx r;
+		Reg r
+	| "pow", [b; e] ->
+		let bs = match gen_operand ctx b with
+			| Imm s -> s | Reg r -> r in
+		let es = match gen_operand ctx e with
+			| Imm s -> s | Reg r -> r in
+		let r = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = call @sa_math_pow(%s, %s)" r bs es);
+		track ctx r;
+		Reg r
+	| "random", [] ->
+		let r = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = call @sa_math_random()" r);
+		track ctx r;
+		Reg r
+	| _ ->
+		comment ctx ("SA-TODO(v0.24): Math." ^ cf.cf_name);
+		Imm "0"
 
 and gen_string_eq ctx op e1 e2 =
 	match string_pair_or_call ctx e1, string_pair_or_call ctx e2 with
@@ -2983,6 +3045,8 @@ let generate com =
 		output_string ch "@import \"sa_std/fmt.sai\"\n";
 	if buf_has body "sa_time_" || buf_has funcs "sa_time_" then
 		output_string ch "@import \"sa_std/time.sai\"\n";
+	if buf_has body "sa_math_" || buf_has funcs "sa_math_" then
+		output_string ch "@import \"sa_std/math.sai\"\n";
 	if buf_has body "NET_TCP_" || buf_has funcs "NET_TCP_"
 	|| buf_has body "NET_ADDR_" || buf_has funcs "NET_ADDR_" then
 		output_string ch "@import \"sa_std/net.sa\"\n";
