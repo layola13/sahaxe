@@ -173,4 +173,7 @@ struct 20%, array 10%)。按用户指令：基础特性优先，其次 hxml，�
 - v0.14: 可存 computed-string (concat/fmt 物化自有堆 + 出口释放，
   句柄即时 free；嵌套 concat 递归物化)；fixture StrStore；
   16 fixture Referee 全绿。
+- v0.15: `@:generic` 单态化直通 (typer 特化后常规发射；
+  裸泛型诚实延后) + `br` 统一寄存器绑定 (Imm 条件不再非法)；
+  String 返回值比较诚实延后；fixture GenHx；17 fixture 全绿。
 - 每个版本独立提交并推送，`sa_std` 缺失先补 `sci/sa_std`。

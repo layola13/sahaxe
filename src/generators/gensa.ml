@@ -1571,6 +1571,17 @@ and switch_pat_const e =
 	to the pre-subject snapshot so every edge into the merge label
 	carries the same live set. String subjects use the supplemented
 	`STRING_EQ` macro via per-pattern EXPANDs. *)
+(** Condition register: `br` needs a register, never an immediate
+	(failed lowerings yield Imm fallbacks that must be bound). *)
+and cond_reg ctx e =
+	match gen_operand ctx e with
+	| Reg r -> r
+	| Imm s ->
+		let r = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = add %s, 0" r s);
+		track ctx r;
+		r
+
 and gen_switch ctx sw =
 	let all_pats = List.concat (List.map (fun c -> c.case_patterns) sw.switch_cases) in
 	let str_mode = is_string_t sw.switch_subject.etype in
@@ -1861,8 +1872,7 @@ and gen_stmt ctx e =
 		let emit_cond () =
 			emit_label ctx l_cond;
 			let n0 = List.length ctx.live in
-			let co = gen_operand ctx cond in
-			let cs = match co with Imm s -> s | Reg r -> r in
+			let cs = cond_reg ctx cond in
 			emit ctx (Printf.sprintf "br %s -> %s, %s" cs l_body l_end);
 			cond_snap := snapshot ctx;
 			cond_regs := take_live (List.length ctx.live - n0) ctx.live
