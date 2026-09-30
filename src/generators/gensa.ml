@@ -303,6 +303,32 @@ let str_len_name v = v.v_name ^ "_len"
 
 (** Expand tf_args against the TFun formal types. None = some param
 	is neither scalar nor String (function skipped honestly). *)
+(** True when a type mentions a type parameter (bare generic). Used
+	to give actionable guidance instead of a cryptic TODO. *)
+let rec mentions_param t =
+	match t with
+	| TInst ({ cl_kind = KTypeParameter _ }, _) -> true
+	| TInst (_, tl) | TAbstract (_, tl) | TEnum (_, tl) ->
+		List.exists mentions_param tl
+	| TFun (args, ret) ->
+		List.exists (fun (_, _, a) -> mentions_param a) args
+		|| mentions_param ret
+	| TType (_, tl) -> List.exists mentions_param tl
+	| TAnon a ->
+		PMap.fold (fun cf acc -> acc || mentions_param cf.cf_type) a.a_fields false
+	| TDynamic (Some t2) -> mentions_param t2
+	| _ -> false
+
+(** Guidance for bare-generic rejections (v0.22 boundary). *)
+let generic_hint ctx c cf =
+	comment ctx ("SA-NOTE(v0.22): bare generic " ^
+		s_type_path c.cl_path ^ "." ^ cf.cf_name ^
+		" skipped; add @:generic for monomorphization")
+
+(** True when a class field signature mentions type parameters. *)
+let cf_is_bare_generic cf =
+	mentions_param cf.cf_type
+
 let expand_sig tf args ret_of =
 	let formals = List.map (fun (_, _, t) -> t) args in
 	let paired =
@@ -1055,7 +1081,9 @@ and gen_ifield_set ctx obj c cf rhs =
 and gen_new ctx c args =
 	let name = sa_ctor_name c in
 	if not (Hashtbl.mem ctx.emitted name) then begin
-		comment ctx ("SA-TODO(v0.9): non-emitted ctor " ^ s_type_path c.cl_path);
+		(match c.cl_constructor with
+		| Some ccf when cf_is_bare_generic ccf -> generic_hint ctx c ccf
+		| _ -> comment ctx ("SA-TODO(v0.9): non-emitted ctor " ^ s_type_path c.cl_path));
 		Imm "0"
 	end else begin
 		let ss = match c.cl_constructor with
@@ -1079,7 +1107,8 @@ and gen_new ctx c args =
 and gen_method_call ctx c cf obj args =
 	let name = sa_fun_name c cf in
 	if not (Hashtbl.mem ctx.emitted name) then begin
-		comment ctx ("SA-TODO(v0.9): non-emitted method " ^
+		if cf_is_bare_generic cf then generic_hint ctx c cf
+		else comment ctx ("SA-TODO(v0.9): non-emitted method " ^
 			s_type_path c.cl_path ^ "." ^ cf.cf_name);
 		Imm "0"
 	end else begin
@@ -2578,7 +2607,8 @@ and net_close_stmt ctx lnr =
 and gen_call ctx c cf args =
 	let name = sa_fun_name c cf in
 	if not (Hashtbl.mem ctx.emitted name) then begin
-		comment ctx ("SA-TODO(v0.6): call to non-emitted " ^
+		if cf_is_bare_generic cf then generic_hint ctx c cf
+		else comment ctx ("SA-TODO(v0.6): call to non-emitted " ^
 			s_type_path c.cl_path ^ "." ^ cf.cf_name);
 		Imm "0"
 	end else match splice_args ctx cf args with

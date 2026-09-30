@@ -195,4 +195,8 @@ struct 20%, array 10%)。按用户指令：基础特性优先，其次 hxml，�
 - v0.21: 结构 enum 相等 (tag 开关 + 逐构造载荷比较，
   单测试寄存器 + 全路径快照纪律)；fixture EnumEq；
   23 fixture 全绿。
+- v0.22: 裸泛型定界 — `@:generic` 由 typer 特化后直通；
+  裸泛型在调用点输出可操作指引 (`SA-NOTE` 加 `@:generic`)，
+  因完整单态化需 texpr 级类型代换 (超出单轮 scope)；
+  fixture BareGen；24 fixture 全绿。
 - 每个版本独立提交并推送，`sa_std` 缺失先补 `sci/sa_std`。
