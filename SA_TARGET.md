@@ -102,11 +102,23 @@ Haxe Std → `sci/sa_std` 映射只允许引用已存在的契约；
 - Hello-world: `haxe --sa /tmp/hx_hello.sa -main Hello -cp tests/sa-demo`
   (待 lowering 落地后启用)，再用 `sa build-exe /tmp/hx_hello.sa` 校验。
 
-## 7. 路线图
+## 7. 路线图 (demo 语料优先级)
+
+语料普查 (`sa_all/survey_demos.py`, 608 个入口)：
+`sa_plugin_ts/demos` 286 个 (function 100%, arith 62%, for 25%,
+if 24%, array 21%, struct 17%, switch 10%, enum 6%)，
+`sa_plugin_sla/demos` 322 个 (arith/if/function/return ~99%,
+struct 20%, array 10%)。按用户指令：基础特性优先，其次 hxml，最后宏。
 
 - v0.1 (本提交): 平台注册 + 骨架发射 + 文档 (可编译，可出已知-good 形状)。
-- v0.2: 常量/局部变量/`stack_alloc` 驻留 + 整数算术 + `trace`。
-- v0.3: `if/while` → `br+jmp`，`switch` → `eq` 链。
-- v0.4: 函数/调用 (borrow/move 前缀)，字符串 (`fmt` + buffer 三件套)。
-- v0.5: 数组/Vec、Option/Result、异常 `panic` → `T!`/`?`。
+- v0.2: 常量/局部变量/`stack_alloc` 驻留 + 整数算术 + `trace`
+  (覆盖 function/return/arith，即 ~100% demo 的骨架需求)。
+- v0.3: `if/else` + bool 逻辑 + `while`/`for` → `br`+`jmp`
+  (覆盖 if 24-99%, for 25%, while 5%)。
+- v0.4: 数组/Vec、struct、字符串 (`fmt` + buffer 三件套)。
+- v0.5: `switch` → `eq` 链、enum、type alias、函数调用
+  (borrow/move 前缀)，fs/net (`fs.sai`/`net.sai`)。
+- v0.6: class、泛型单态化、异常 `panic` → `T!`/`?`。
+- v0.7: hxml 工程支持 (`--sa` 与现有 `--next/--each` 批处理互通)。
+- v0.8: 宏 (`--macro`) 在 SA 目标下的求值与展开。
 - 每个版本独立提交并推送，`sa_std` 缺失先补 `sci/sa_std`。

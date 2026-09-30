@@ -35,4 +35,25 @@ class Boot {
 		(`sa_std/io/print.sai`) by the SA generator.
 	**/
 	public static function trace(v:Dynamic):Void {}
+
+	// --- v0.1 stubs, lowered to sci/sa_std contracts (see SA_TARGET.md) ---
+	public static function __instanceof(v:Dynamic, t:Dynamic):Bool {
+		return false;
+	}
+
+	public static function clampInt32(x:Float):Int {
+		return 0;
+	}
+
+	public static function stringify(v:Dynamic):String {
+		return "";
+	}
+
+	public static function parseIntPrefix(x:String):Null<Int> {
+		return null;
+	}
+
+	public static function parseFloatPrefix(x:String):Float {
+		return Math.NaN;
+	}
 }

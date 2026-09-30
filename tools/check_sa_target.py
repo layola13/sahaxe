@@ -17,6 +17,8 @@ CHECKS = [
     ("src/compiler/generate.ml", ["Gensa.generate"]),
     ("src/macro/macroApi.ml", ["| Sa -> 12"]),
     ("src/optimization/analyzerTexpr.ml", ["| Lua | Python | Sa ->"]),
+    ("src/filters/exception/exceptionInit.ml", ["| Php | Js | Jvm | Python | Lua | Eval | Neko | Flash | Hl | Cpp | Sa ->"]),
+    ("std/sa/_std/Std.hx", ["@:coreApi class Std", "sa.Boot"]),
     ("src/generators/gensa.ml", [
         '@import \\"sa_std/io/print.sai\\"',
         "@main() -> i32:",
