@@ -81,6 +81,9 @@ type ctx = {
 	mutable pslot : string option;
 	(** Homed `this` slot for methods/constructors (None outside). *)
 	mutable this_slot : string option;
+	(** Enclosing function return kind ("i32", "void", "String", ...).
+		Drives String-return pairing. *)
+	mutable ret_kind : string;
 }
 
 let fresh ctx prefix =
@@ -120,6 +123,9 @@ let forget ctx r =
 let release_now ctx r =
 	emit ctx ("!" ^ r);
 	forget ctx r
+
+(** Unwrap an operand to source text. *)
+let ops = function Imm s -> s | Reg r -> r
 
 (** Path-discipline helpers: sibling branch paths are generated
 	sequentially but execute exclusively. Each arm must start from the
@@ -288,8 +294,7 @@ let is_enum_t t =
 	| _ -> false
 
 (** Expanded parameter: scalars pass by value, strings as
-	`(name_ptr: ptr, name_len: u64)` borrow pairs. *)
-type param_exp =
+	`(name_ptr: ptr, name_len: u64)` borrow pairs. *)type param_exp =
 	| Scalar of tvar * string
 	| StrPair of tvar
 
@@ -316,7 +321,9 @@ let expand_sig tf args ret_of =
 			let exps = List.map (function Some x -> x | None -> assert false) exps in
 			match ret_of with
 			| None -> Some (tf, exps, "")
-			| Some rt -> (match scalar_ret rt with
+			| Some rt ->
+				if is_string_t rt then Some (tf, exps, "String")
+				else (match scalar_ret rt with
 				| None -> None
 				| Some rs -> Some (tf, exps, rs))
 	end
@@ -512,7 +519,7 @@ let new_fun_ctx com header emitted funcs = {
 	next_reg = 0; next_str = 0; next_label = 0;
 	vars = Hashtbl.create 16; live = []; loops = [];
 	emitted; funcs;
-	str_lens = Hashtbl.create 8; pslot = None; this_slot = None;
+	str_lens = Hashtbl.create 8; pslot = None; this_slot = None; ret_kind = "i32";
 }
 
 (** Lazily create the entry scratch slot for buffered prints. Must be
@@ -1083,6 +1090,13 @@ and gen_method_call ctx c cf obj args =
 			comment ctx "SA-TODO(v0.13): unresolvable method argument";
 			Imm "0"
 		| Some rest ->
+		let is_str_ret = match follow cf.cf_type with
+			| TFun (_, r) -> is_string_t r
+			| _ -> false in
+		let rest = if is_str_ret then
+			let ps = (match ctx.pslot with Some s -> s | None -> ensure_pslot ctx) in
+			rest @ ["&" ^ ps]
+		else rest in
 		let ret = match follow cf.cf_type with
 			| TFun (_, r) -> scalar_ret r
 			| _ -> None in
@@ -1320,12 +1334,53 @@ and gen_binop ctx op e1 e2 etype =
 		Reg r
 	end
 
+(** String pair resolution for chain-internal callers: static pairs
+	first, else String-returning calls (emitted with `&pslot`, length
+	read back immediately). *)
+and string_pair_or_call ctx e =
+	match string_operands ctx e with
+	| Some (p, l) ->
+		let lop = (try ignore (int_of_string l); Imm l with _ -> Reg l) in
+		Some (p, lop)
+	| None -> match e.eexpr with
+	| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, args) -> begin
+		match follow cf.cf_type with
+		| TFun (_, r) when is_string_t r ->
+			if not (Hashtbl.mem ctx.emitted (sa_fun_name c cf)) then None
+			else begin match gen_call ctx c cf args with
+			| Reg p ->
+				let ps = (match ctx.pslot with Some s -> s | None -> ensure_pslot ctx) in
+				let l = fresh ctx "t" in
+				emit ctx (Printf.sprintf "%s = load %s+0 as u64" l ps);
+				track ctx l;
+				Some (p, Reg l)
+			| Imm _ -> None
+			end
+		| _ -> None
+	end
+	| TCall ({ eexpr = TField (obj, FInstance (c, _, cf)) }, args) -> begin
+		match follow cf.cf_type with
+		| TFun (_, r) when is_string_t r ->
+			if not (Hashtbl.mem ctx.emitted (sa_fun_name c cf)) then None
+			else begin match gen_method_call ctx c cf obj args with
+			| Reg p ->
+				let ps = (match ctx.pslot with Some s -> s | None -> ensure_pslot ctx) in
+				let l = fresh ctx "t" in
+				emit ctx (Printf.sprintf "%s = load %s+0 as u64" l ps);
+				track ctx l;
+				Some (p, Reg l)
+			| Imm _ -> None
+			end
+		| _ -> None
+	end
+	| _ -> None
+
 and gen_string_eq ctx op e1 e2 =
-	match string_operands ctx e1, string_operands ctx e2 with
+	match string_pair_or_call ctx e1, string_pair_or_call ctx e2 with
 	| Some (p1, l1), Some (p2, l2) ->
 		let r = fresh ctx "t" in
 		let mn = if op = OpEq then "STRING_EQ" else "STRING_NEQ" in
-		emit ctx (Printf.sprintf "EXPAND %s %s, %s, %s, %s, %s" mn r p1 l1 p2 l2);
+		emit ctx (Printf.sprintf "EXPAND %s %s, %s, %s, %s, %s" mn r p1 (ops l1) p2 (ops l2));
 		track ctx r;
 		Reg r
 	| _ ->
@@ -1356,6 +1411,7 @@ and materialize_owned ctx e : (string * operand) option =
 		materialize_concat_owned ctx l r
 	| TParenthesis e1 | TMeta (_, e1) | TCast (e1, _) ->
 		materialize_owned ctx e1
+	| TCall _ -> string_pair_or_call ctx e
 	| _ -> None
 
 (** Owned copy of `Sys.getEnv` / `Sys.getCwd` (miss panics, like trace). *)
@@ -1495,11 +1551,11 @@ and trace_string_value ctx e : bool =
 	| TBinop (OpAdd, l, r) when is_string_t e.etype ->
 		trace_concat ctx l r
 	| TParenthesis e1 | TMeta (_, e1) | TCast (e1, _) -> trace_string_value ctx e1
-	| _ -> match string_operands ctx e with
+	| _ -> match string_pair_or_call ctx e with
 		| Some (p, l) ->
 			let ps = (match ctx.pslot with Some s -> s | None -> ensure_pslot ctx) in
 			emit ctx (Printf.sprintf "store %s+0, %s as ptr" ps p);
-			emit ctx (Printf.sprintf "call @sa_print_bytes(&%s, %s)" ps l);
+			emit ctx (Printf.sprintf "call @sa_print_bytes(&%s, %s)" ps (ops l));
 			true
 		| None -> false
 
@@ -1568,12 +1624,12 @@ and trace_concat ctx l r =
 		| TParenthesis e1 | TMeta (_, e1) | TCast (e1, _) -> flatten acc e1
 		| _ -> acc @ [e] in
 	let parts = flatten (flatten [] l) r in
-	let resolved = List.map (string_operands ctx) parts in
+	let resolved = List.map (string_pair_or_call ctx) parts in
 	if List.length parts < 2 || List.exists ((=) None) resolved then begin
 		comment ctx "SA-TODO(v0.6): concat needs resolvable sides";
 		false
 	end else begin
-		let pairs = List.map (function Some x -> x | None -> ("", "")) resolved in
+		let pairs = List.map (function Some (p, l) -> (p, ops l) | None -> ("", "")) resolved in
 		let cur = ref "" in
 		let do_concat h pa la pb lb =
 			emit ctx (Printf.sprintf "%s = call @sa_string_concat(%s, %s, %s, %s)"
@@ -1835,7 +1891,7 @@ and gen_switch ctx sw =
 		false
 	end else begin
 		let snap_all = snapshot ctx in
-		let subj_str = if str_mode then string_operands ctx sw.switch_subject else None in
+		let subj_str = if str_mode then string_pair_or_call ctx sw.switch_subject else None in
 		if str_mode && subj_str = None then begin
 			comment ctx "SA-TODO(v0.6): string switch needs tracked lengths";
 			false
@@ -1843,7 +1899,7 @@ and gen_switch ctx sw =
 		let ss = if str_mode then "" else
 			match gen_operand ctx sw.switch_subject with
 			| Imm s -> s | Reg r -> r in
-		let ssubj = match subj_str with Some x -> x | None -> ("", "") in
+		let ssubj = match subj_str with Some (p, l) -> (p, ops l) | None -> ("", "") in
 		let l_end = fresh_label ctx "ENDSWITCH" in
 		let l_def = match sw.switch_default with
 			| Some _ -> Some (fresh_label ctx "SWDEF")
@@ -2035,6 +2091,20 @@ and gen_stmt ctx e =
 		end
 	| TReturn ret ->
 		let keep = match ret with
+			| Some re when is_string_t re.etype && ctx.ret_kind = "String" ->
+				begin match materialize_owned ctx re with
+				| Some (p, lop) ->
+					let ls = match lop with Imm s -> s | Reg rr -> rr in
+					emit ctx (Printf.sprintf "store __retlen+0, %s as u64" ls);
+					let keep = if String.length p > 0 && p.[0] = '&' then None
+						else Some p in
+					release_all_except ctx keep;
+					Imm p
+				| None ->
+					comment ctx "SA-TODO(v0.20): unreturnable string";
+					emit ctx "store __retlen+0, 0 as u64";
+					release_all_except ctx None; Imm "0"
+				end
 			| Some re -> begin match gen_operand ctx re with
 				| Imm s -> release_all_except ctx None; Imm s
 				| Reg r -> release_all_except ctx (Some r); Reg r end
@@ -2069,8 +2139,7 @@ and gen_stmt ctx e =
 		ignore (gen_operand ctx e);
 		false
 	| TIf (cond, then_e, else_opt) ->
-		let co = gen_operand ctx cond in
-		let cs = match co with Imm s -> s | Reg r -> r in
+		let cs = cond_reg ctx cond in
 		let l_then = fresh_label ctx "THEN" in
 		let l_end = fresh_label ctx "ENDIF" in
 		let arm_state = save_live ctx in
@@ -2192,6 +2261,8 @@ and gen_stmt ctx e =
 
 and gen_function fctx name tf exps ret body_stmts this_kind =
 	ignore (ensure_pslot fctx);
+	fctx.ret_kind <- ret;
+	if ret = "String" then track fctx "__retlen";
 	(* `this` homing: constructors allocate, methods home the self
 		param. The slot makes field access uniform with locals. *)
 	let this_ret = match this_kind with
@@ -2251,6 +2322,9 @@ and gen_function fctx name tf exps ret body_stmts this_kind =
 			release_all_except fctx None;
 			(match ret with
 			| "void" -> emit fctx "return"
+			| "String" ->
+				emit fctx "store __retlen+0, 0 as u64";
+				emit fctx "return 0"
 			| _ -> emit fctx "return 0")
 	end;
 	let b = Buffer.create 2048 in
@@ -2262,11 +2336,13 @@ and gen_function fctx name tf exps ret body_stmts this_kind =
 	let params = match this_kind with
 		| `ThisParam -> "self: ptr" :: params
 		| _ -> params in
+	let ret_ty = if ret = "String" then "ptr" else ret in
+	let params = if ret = "String" then params @ ["__retlen: ptr"] else params in
 	let sig_ = String.concat ", " params in
 	Buffer.add_string b (Printf.sprintf "
 @%s(%s) -> %s:
 L_ENTRY:
-" name sig_ ret);
+" name sig_ ret_ty);
 	Buffer.add_string b (Buffer.contents fctx.buf);
 	Buffer.add_string fctx.funcs (Buffer.contents b)
 
@@ -2283,8 +2359,8 @@ and splice_args ctx cf args : string list option =
 		| [], [] -> Some (List.rev acc)
 		| a :: rest_a, t :: rest_t ->
 			if is_string_t t then
-				(match string_operands ctx a with
-				| Some (p, l) -> loop (l :: p :: acc) (rest_a, rest_t)
+				(match string_pair_or_call ctx a with
+				| Some (p, l) -> loop (ops l :: p :: acc) (rest_a, rest_t)
 				| None -> None)
 			else begin
 				let s = match gen_operand ctx a with
@@ -2364,9 +2440,13 @@ and gen_call ctx c cf args =
 		comment ctx "SA-TODO(v0.13): unresolvable call argument";
 		Imm "0"
 	| Some ss -> begin
-		let ret = match follow cf.cf_type with
-			| TFun (_, r) -> scalar_ret r
-			| _ -> None in
+		let (ret, is_str_ret) = match follow cf.cf_type with
+			| TFun (_, r) -> (scalar_ret r, is_string_t r)
+			| _ -> (None, false) in
+		let ss = if is_str_ret then
+			let ps = (match ctx.pslot with Some s -> s | None -> ensure_pslot ctx) in
+			ss @ ["&" ^ ps]
+		else ss in
 		match ret with
 		| Some "void" ->
 			emit ctx (Printf.sprintf "call @%s(%s)" name (String.concat ", " ss));
@@ -2409,7 +2489,7 @@ let generate com =
 		next_reg = 0; next_str = 0; next_label = 0;
 		vars = Hashtbl.create 16; live = []; loops = [];
 		emitted; funcs;
-		str_lens = Hashtbl.create 8; pslot = None; this_slot = None;
+		str_lens = Hashtbl.create 8; pslot = None; this_slot = None; ret_kind = "i32";
 	} in
 	List.iter (print_type types) com.types;
 	let (stmts, has_args, main_class) = match com.main.main_expr with

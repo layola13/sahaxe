@@ -189,4 +189,7 @@ struct 20%, array 10%)。按用户指令：基础特性优先，其次 hxml，�
 - v0.19: payload enum (tagged 堆对象构造 + `TEnumParameter`
   载荷提取 + 枚举对象透传；结构相等诚实延后) +
   全终结分支省略空合并标号；fixture PayEn；21 fixture 全绿。
+- v0.20: String 返回值 (`__retlen` 配对回传：签名/调用/TReturn/
+  lens 全链路)；`br` 条件全量绑定；fixture StrRet；
+  22 fixture 全绿。
 - 每个版本独立提交并推送，`sa_std` 缺失先补 `sci/sa_std`。
