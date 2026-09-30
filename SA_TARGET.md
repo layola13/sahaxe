@@ -55,6 +55,7 @@ Haxe Std → `sci/sa_std` 映射只允许引用已存在的契约；
 |---|---|---|
 | `trace` / `Sys.print` | `sa_std/io/print.sai` (`@sa_print_bytes`) | v0.1 已用 |
 | 整数格式化 (`Std.string(i)`) | `sa_std/fmt.sai` (`sa_fmt_*_into`, buffer 三件套) | 待接入 |
+| 字符串相等 (`==`, switch-on-string) | `sa_std/string.sa` (`STRING_EQ`/`STRING_NEQ`, 已补，无新 ABI) | v0.5c 已补 |
 | 字符串 | `sa_std/string.sai` + `string.sa` | 待接入 |
 | 数组/Vec | `sa_std/vec.sa` + `alloc/vec.sal` | 待接入 |
 | Map | `sa_std/hashmap.sa` / `btree_map.sa` | 待接入 |
