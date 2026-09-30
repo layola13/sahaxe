@@ -154,13 +154,14 @@ let is_int_t t =
 	| _ -> false
 
 (** Memory annotation for homed slots: Float -> f64, Int/Bool -> i32,
-	everything else (Array/String/objects) -> ptr. Deterministic per
-	type so matching load/store pairs always agree. *)
+	UInt -> u64, everything else (Array/String/objects) -> ptr.
+	Deterministic per type so matching load/store pairs always agree. *)
 let mem_ty t =
 	if is_float_t t then "f64"
 	else match follow t with
 	| TAbstract ({ a_path = ([], "Int") }, _)
 	| TAbstract ({ a_path = ([], "Bool") }, _) -> "i32"
+	| TAbstract ({ a_path = ([], "UInt") }, _) -> "u64"
 	| _ -> "ptr"
 
 (** Integer arithmetic mnemonic (None = unsupported for v0.9 ints). *)
@@ -968,6 +969,14 @@ let rec gen_operand ctx e =
 	| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, _)
 		when s_type_path c.cl_path = "Sys" && cf.cf_name = "time" ->
 		sys_time_op ctx
+	| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, [port])
+		when s_type_path c.cl_path = "sa.net.Tcp" && cf.cf_name = "listen" ->
+		net_listen_op ctx (gen_operand ctx port)
+	| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, [lnr])
+		when s_type_path c.cl_path = "sa.net.Tcp" && cf.cf_name = "boundPort" ->
+		(match gen_operand ctx lnr with
+		| Imm s -> net_bound_port_op ctx s
+		| Reg r -> net_bound_port_op ctx r)
 	| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, args) ->
 		(match sys_surface_operand ctx c cf args with
 		| Some o -> o
@@ -1951,6 +1960,11 @@ and gen_stmt ctx e =
 	| TCall (fn, args) when callee_is_trace fn ->
 		gen_trace ctx args;
 		false
+	| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, [lnr])
+		when s_type_path c.cl_path = "sa.net.Tcp" && cf.cf_name = "close" ->
+		(match gen_operand ctx lnr with
+		| Imm s -> ignore (net_close_stmt ctx s); false
+		| Reg r -> ignore (net_close_stmt ctx r); false)
 	| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, args) ->
 		if sys_surface_stmt ctx c cf args then false
 		else (match s_type_path c.cl_path, cf.cf_name, args with
@@ -2192,6 +2206,65 @@ and splice_args ctx cf args : string list option =
 		| _ -> None in
 	loop [] (args, formals)
 
+(** v0.18 TCP surface over existing `NET_TCP_*` macros (zero new ABI).
+	Handles stay u64-typed regs (Haxe `UInt` slots); failures panic
+	loudly like fs. Sockets/streams stay deferred. *)
+and panic_unless_ok ctx st msg =
+	let ok = fresh ctx "t" in
+	emit ctx (Printf.sprintf "%s = eq %s, 0" ok st);
+	track ctx ok;
+	let l_ok = fresh_label ctx "NETOK" in
+	let l_fail = fresh_label ctx "NETFAIL" in
+	emit ctx (Printf.sprintf "br %s -> %s, %s" ok l_ok l_fail);
+	emit_label ctx l_fail;
+	emit ctx (Printf.sprintf "panic(\"%s\")" msg);
+	emit_label ctx l_ok;
+	release_now ctx ok
+
+and net_listen_op ctx port =
+	let ps = match port with Imm s -> s | Reg r -> r in
+	let (hn, hl) = intern_string ctx "127.0.0.1" in
+	let st = fresh ctx "t" in
+	let lnr = fresh ctx "t" in
+	let dp = fresh ctx "t" in
+	emit ctx (Printf.sprintf
+		"EXPAND NET_TCP_LISTENER_BIND_PORT %s, %s, %s, &%s, %d, %s"
+		st lnr dp hn hl ps);
+	track ctx st;
+	track ctx lnr;
+	track ctx dp;
+	panic_unless_ok ctx st;
+	release_now ctx st;
+	release_now ctx dp;
+	Reg lnr
+
+and net_bound_port_op ctx lnr =
+	let st = fresh ctx "t" in
+	let addr = fresh ctx "t" in
+	emit ctx (Printf.sprintf "EXPAND NET_TCP_LISTENER_LOCAL_ADDR %s, %s, %s"
+		st addr lnr);
+	track ctx st;
+	track ctx addr;
+	panic_unless_ok ctx st;
+	release_now ctx st;
+	let port = fresh ctx "t" in
+	emit ctx (Printf.sprintf "EXPAND NET_ADDR_PORT %s, %s" port addr);
+	track ctx port;
+	let st2 = fresh ctx "t" in
+	emit ctx (Printf.sprintf "EXPAND NET_ADDR_FREE %s, %s" st2 addr);
+	track ctx st2;
+	release_now ctx st2;
+	release_now ctx addr;
+	Reg port
+
+and net_close_stmt ctx lnr =
+	let st = fresh ctx "t" in
+	emit ctx (Printf.sprintf "EXPAND NET_TCP_LISTENER_CLOSE %s, %s" st lnr);
+	track ctx st;
+	panic_unless_ok ctx st;
+	release_now ctx st;
+	true
+
 and gen_call ctx c cf args =
 	let name = sa_fun_name c cf in
 	if not (Hashtbl.mem ctx.emitted name) then begin
@@ -2365,6 +2438,9 @@ let generate com =
 		output_string ch "@import \"sa_std/fmt.sai\"\n";
 	if buf_has body "sa_time_" || buf_has funcs "sa_time_" then
 		output_string ch "@import \"sa_std/time.sai\"\n";
+	if buf_has body "NET_TCP_" || buf_has funcs "NET_TCP_"
+	|| buf_has body "NET_ADDR_" || buf_has funcs "NET_ADDR_" then
+		output_string ch "@import \"sa_std/net.sa\"\n";
 	if buf_has body "FS_" || buf_has funcs "FS_"
 	|| buf_has body "sa_fs_" || buf_has funcs "sa_fs_" then
 		output_string ch "@import \"sa_std/fs.sa\"\n";
