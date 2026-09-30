@@ -56,14 +56,27 @@ type ctx = {
 	header : Buffer.t;
 	mutable next_reg : int;
 	mutable next_str : int;
+	mutable next_label : int;
 	vars : (int, string) Hashtbl.t;
 	mutable live : string list;
+	(** Loop stack: (end_label, cond_label, entry_snap, cond_snap).
+		`entry_snap` is the live length at loop entry (plain vars);
+		`cond_snap` the length after the condition is evaluated
+		(cond temps included). All edges into L_COND carry exactly
+		`entry_snap` regs; all edges into L_END carry `cond_snap` regs,
+		so every merge is Phi-consistent (see sala 06_limitations). *)
+	mutable loops : (string * string * int * int ref) list;
 }
 
 let fresh ctx prefix =
 	let id = ctx.next_reg in
 	ctx.next_reg <- id + 1;
 	Printf.sprintf "%s%d" prefix id
+
+let fresh_label ctx prefix =
+	let id = ctx.next_label in
+	ctx.next_label <- id + 1;
+	Printf.sprintf "L_%s%d" prefix id
 
 let emit ctx s =
 	Buffer.add_string ctx.buf "    ";
@@ -74,6 +87,11 @@ let comment ctx s =
 	Buffer.add_string ctx.buf "    // ";
 	Buffer.add_string ctx.buf s;
 	Buffer.add_char ctx.buf '\n'
+
+(** Labels start at column 0 (macro/label rule, see sala 06_limitations). *)
+let emit_label ctx l =
+	Buffer.add_string ctx.buf l;
+	Buffer.add_string ctx.buf ":\n"
 
 let track ctx r =
 	ctx.live <- r :: ctx.live
@@ -139,6 +157,62 @@ let rec gen_operand ctx e =
 			comment ctx ("SA-TODO(v0.2): assign to unhomed " ^ v.v_name);
 			Imm "0"
 	end
+	| TBinop (OpAssignOp op, { eexpr = TLocal v }, rhs) -> begin
+		(* Optimizer desugar: `x = x + e` arrives as OpAssignOp. *)
+		try
+			let slot = Hashtbl.find ctx.vars v.v_id in
+			let ty = if is_float_t v.v_type then "f64" else "i32" in
+			let cur = fresh ctx "t" in
+			emit ctx (Printf.sprintf "%s = load %s+0 as %s" cur slot ty);
+			track ctx cur;
+			let o = gen_operand ctx rhs in
+			let os = match o with Imm s -> s | Reg r -> r in
+			let mn = match op with
+				| OpAdd -> "add" | OpSub -> "sub" | OpMult -> "mul"
+				| OpDiv -> "sdiv" | OpMod -> "srem"
+				| OpAnd -> "and" | OpOr -> "or" | OpXor -> "xor"
+				| OpShl -> "shl" | OpShr -> "ashr" | OpUShr -> "lshr"
+				| _ -> ""
+			in
+			if mn = "" then begin
+				comment ctx ("SA-TODO(v0.3): assign-op " ^ Ast.s_binop op);
+				Imm "0"
+			end else begin
+				let r = fresh ctx "t" in
+				emit ctx (Printf.sprintf "%s = %s %s, %s" r mn cur os);
+				track ctx r;
+				emit ctx (Printf.sprintf "store %s+0, %s as %s" slot r ty);
+				Reg r
+			end
+		with Not_found ->
+			comment ctx ("SA-TODO(v0.2): assign-op to unhomed " ^ v.v_name);
+			Imm "0"
+	end
+	| TUnop (op, _, { eexpr = TLocal v }) -> begin
+		(* `i++` / `i--` (optimizer also rewrites `i = i + 1`). *)
+		try
+			let slot = Hashtbl.find ctx.vars v.v_id in
+			let ty = if is_float_t v.v_type then "f64" else "i32" in
+			let cur = fresh ctx "t" in
+			emit ctx (Printf.sprintf "%s = load %s+0 as %s" cur slot ty);
+			track ctx cur;
+			let mn = match op with
+				| Increment -> "add" | Decrement -> "sub" | _ -> ""
+			in
+			if mn = "" then begin
+				comment ctx "SA-TODO(v0.4): prefix unop (neg/not)";
+				Reg cur
+			end else begin
+				let r = fresh ctx "t" in
+				emit ctx (Printf.sprintf "%s = %s %s, 1" r mn cur);
+				track ctx r;
+				emit ctx (Printf.sprintf "store %s+0, %s as %s" slot r ty);
+				Reg r
+			end
+		with Not_found ->
+			comment ctx ("SA-TODO: unop on unhomed " ^ v.v_name);
+			Imm "0"
+	end
 	| TBinop (op, e1, e2) -> gen_binop ctx op e1 e2 e.etype
 	| TParenthesis e1 | TMeta (_, e1) -> gen_operand ctx e1
 	| TCast (e1, _) -> gen_operand ctx e1
@@ -170,7 +244,8 @@ and gen_binop ctx op e1 e2 etype =
 	in
 	match mnemonic with
 	| None ->
-		comment ctx "SA-TODO(v0.2): unsupported operator for operand types";
+		comment ctx ("SA-TODO(v0.2): unsupported operator " ^ Ast.s_binop op ^
+			(if float_ctx then " (float)" else " (int)"));
 		Imm "0"
 	| Some mn ->
 		let o1 = gen_operand ctx e1 in
@@ -235,6 +310,21 @@ let gen_trace ctx args =
 	| _ ->
 		comment ctx "SA-TODO(v0.2): trace of non-literal (needs fmt buffer)"
 
+let expr_kind e =
+	match e.eexpr with
+	| TConst _ -> "TConst" | TLocal _ -> "TLocal" | TArray _ -> "TArray"
+	| TBinop (op, _, _) -> "TBinop:" ^ Ast.s_binop op
+	| TField _ -> "TField" | TTypeExpr _ -> "TTypeExpr"
+	| TParenthesis _ -> "TParenthesis" | TObjectDecl _ -> "TObjectDecl"
+	| TArrayDecl _ -> "TArrayDecl" | TCall _ -> "TCall" | TNew _ -> "TNew"
+	| TUnop _ -> "TUnop" | TFunction _ -> "TFunction" | TVar _ -> "TVar"
+	| TBlock _ -> "TBlock" | TIf _ -> "TIf"
+	| TWhile _ -> "TWhile" | TSwitch _ -> "TSwitch" | TTry _ -> "TTry"
+	| TReturn _ -> "TReturn" | TBreak -> "TBreak" | TContinue -> "TContinue"
+	| TThrow _ -> "TThrow" | TCast _ -> "TCast" | TMeta _ -> "TMeta"
+	| TEnumParameter _ -> "TEnumParameter" | TEnumIndex _ -> "TEnumIndex"
+	| TIdent _ -> "TIdent"
+
 let release_all_except ctx keep =
 	List.iter (fun r ->
 		match keep with
@@ -243,21 +333,90 @@ let release_all_except ctx keep =
 	) (List.rev ctx.live);
 	ctx.live <- (match keep with Some k -> [k] | None -> [])
 
+(** Arm-local cleanup (Phi consistency, see sala 06_limitations):
+	release registers created after the snapshot so that every edge
+	arriving at a merge label carries the same live set. *)
+let snapshot ctx = List.length ctx.live
+
+let release_since ctx n =
+	let rec split i acc rest =
+		if i <= 0 then (List.rev acc, rest)
+		else match rest with
+			| [] -> (List.rev acc, [])
+			| r :: rs -> split (i - 1) (r :: acc) rs
+	in
+	let (fresh_regs, outer) = split (List.length ctx.live - n) [] ctx.live in
+	List.iter (fun r -> emit ctx ("!" ^ r)) (List.rev fresh_regs);
+	ctx.live <- outer
+
+(** Pre-pass: collect every `let` in the entry statements (including
+	inside `if`/`while` bodies) so `stack_alloc`s can be hoisted above
+	all branches. Branch-local `stack_alloc` would trap with
+	`PhiStateConflict` (see sala 06_limitations). *)
+let rec collect_vars acc e =
+	match e.eexpr with
+	| TVar (v, _) -> v :: acc
+	| TBlock el -> List.fold_left collect_vars acc el
+	| TIf (c, t, eo) ->
+		let acc = collect_vars acc c in
+		let acc = collect_vars acc t in
+		(match eo with Some x -> collect_vars acc x | None -> acc)
+	| TWhile (c, b, _) -> collect_vars (collect_vars acc c) b
+	| TSwitch _ -> acc
+	| TParenthesis e1 | TMeta (_, e1) | TCast (e1, _) -> collect_vars acc e1
+	| _ -> acc
+
+(** True when the loop body can directly `break`/`continue` THIS loop
+	(jumps inside a nested `while` or a closure belong to it).
+	Used to guard `do-while`: its first iteration runs before any
+	condition temps exist, so a direct jump cannot be merged
+	Phi-consistently and falls back to an honest TODO. *)
+let rec has_direct_jump depth e =
+	match e.eexpr with
+	| TBreak | TContinue -> depth = 0
+	| TWhile _ -> false
+	| TFunction _ -> false
+	| TBlock el -> List.exists (has_direct_jump depth) el
+	| TIf (c, t, eo) ->
+		has_direct_jump depth c || has_direct_jump depth t
+		|| (match eo with Some x -> has_direct_jump depth x | None -> false)
+	| TSwitch sw ->
+		has_direct_jump depth sw.switch_subject
+		|| List.exists (fun c ->
+			List.exists (has_direct_jump depth) c.case_patterns
+			|| has_direct_jump depth c.case_expr) sw.switch_cases
+		|| (match sw.switch_default with
+			| Some x -> has_direct_jump depth x | None -> false)
+	| TTry (e1, catches) ->
+		has_direct_jump depth e1
+		|| List.exists (fun (_, e2) -> has_direct_jump depth e2) catches
+	| TParenthesis e1 | TMeta (_, e1) | TCast (e1, _) -> has_direct_jump depth e1
+	| _ -> false
+
 let rec gen_stmt ctx e =
 	match e.eexpr with
-	| TBlock el -> List.iter (gen_stmt ctx) el
+	| TBlock el ->
+		let term = ref false in
+		List.iter (fun s -> term := gen_stmt ctx s) el;
+		!term
 	| TVar (v, init) ->
-		let slot = fresh ctx "var" in
-		Hashtbl.replace ctx.vars v.v_id slot;
-		emit ctx (Printf.sprintf "%s = stack_alloc 8" slot);
-		track ctx slot;
+		let slot =
+			try Hashtbl.find ctx.vars v.v_id
+			with Not_found ->
+				let s = fresh ctx "var" in
+				Hashtbl.replace ctx.vars v.v_id s;
+				emit ctx (Printf.sprintf "%s = stack_alloc 8" s);
+				track ctx s;
+				s
+		in
 		let ty = if is_float_t v.v_type then "f64" else "i32" in
 		let valu = match init with
 			| Some ie -> begin match gen_operand ctx ie with
 				| Imm s -> s | Reg r -> r end
 			| None -> "0"
 		in
-		emit ctx (Printf.sprintf "store %s+0, %s as %s" slot valu ty)
+		emit ctx (Printf.sprintf "store %s+0, %s as %s" slot valu ty);
+		false
 	| TReturn ret ->
 		let keep = match ret with
 			| Some re -> begin match gen_operand ctx re with
@@ -266,22 +425,110 @@ let rec gen_stmt ctx e =
 			| None -> release_all_except ctx None; Imm "0"
 		in
 		let rs = match keep with Imm s -> s | Reg r -> r in
-		emit ctx (Printf.sprintf "return %s" rs)
+		emit ctx (Printf.sprintf "return %s" rs);
+		true
 	| TCall (fn, args) when callee_is_trace fn ->
-		gen_trace ctx args
+		gen_trace ctx args;
+		false
 	| TCall (fn, _) ->
-		comment ctx ("SA-TODO(v0.4): general call (" ^ callee_kind fn ^ ")")
+		comment ctx ("SA-TODO(v0.4): general call (" ^ callee_kind fn ^ ")");
+		false
 	| TBinop (OpAssign, _, _) ->
-		ignore (gen_operand ctx e)
-	| TIf _ | TWhile _ ->
-		comment ctx "SA-TODO(v0.3): control flow (br+jmp)"
+		ignore (gen_operand ctx e);
+		false
+	| TIf (cond, then_e, else_opt) ->
+		let co = gen_operand ctx cond in
+		let cs = match co with Imm s -> s | Reg r -> r in
+		let l_then = fresh_label ctx "THEN" in
+		let l_end = fresh_label ctx "ENDIF" in
+		(match else_opt with
+		| Some else_e ->
+			let l_else = fresh_label ctx "ELSE" in
+			emit ctx (Printf.sprintf "br %s -> %s, %s" cs l_then l_else);
+			let snap = snapshot ctx in
+			emit_label ctx l_then;
+			let term_then = gen_stmt ctx then_e in
+			release_since ctx snap;
+			if not term_then then emit ctx (Printf.sprintf "jmp %s" l_end);
+			emit_label ctx l_else;
+			let term_else = gen_stmt ctx else_e in
+			release_since ctx snap;
+			if not term_else then emit ctx (Printf.sprintf "jmp %s" l_end);
+			emit_label ctx l_end;
+			term_then && term_else
+		| None ->
+			emit ctx (Printf.sprintf "br %s -> %s, %s" cs l_then l_end);
+			let snap = snapshot ctx in
+			emit_label ctx l_then;
+			let term_then = gen_stmt ctx then_e in
+			release_since ctx snap;
+			if not term_then then emit ctx (Printf.sprintf "jmp %s" l_end);
+			emit_label ctx l_end;
+			false)
+	| TWhile (cond, body, flag) ->
+		let l_cond = fresh_label ctx "COND" in
+		let l_body = fresh_label ctx "BODY" in
+		let l_end = fresh_label ctx "ENDWHILE" in
+		let entry_snap = snapshot ctx in
+		let cond_snap = ref entry_snap in
+		ctx.loops <- (l_end, l_cond, entry_snap, cond_snap) :: ctx.loops;
+		let emit_cond () =
+			emit_label ctx l_cond;
+			let co = gen_operand ctx cond in
+			let cs = match co with Imm s -> s | Reg r -> r in
+			emit ctx (Printf.sprintf "br %s -> %s, %s" cs l_body l_end);
+			cond_snap := snapshot ctx
+		in
+		let emit_body () =
+			emit_label ctx l_body;
+			(* Single incoming edge: drop cond temps so the bottom
+				edge matches the entry edge (live = entry_snap). *)
+			release_since ctx entry_snap;
+			let term = gen_stmt ctx body in
+			release_since ctx entry_snap;
+			if not term then emit ctx (Printf.sprintf "jmp %s" l_cond)
+		in
+		(match flag with
+		| NormalWhile ->
+			emit ctx (Printf.sprintf "jmp %s" l_cond);
+			emit_cond ();
+			emit_body ()
+		| DoWhile when has_direct_jump 0 body ->
+			comment ctx "SA-TODO(v0.3): do-while with break/continue";
+			release_since ctx entry_snap
+		| DoWhile ->
+			emit_body ();
+			emit_cond ());
+		ctx.loops <- (match ctx.loops with _ :: rest -> rest | [] -> []);
+		emit_label ctx l_end;
+		false
+	| TBreak -> begin
+		match ctx.loops with
+		| (l_end, _, _, cond_snap) :: _ ->
+			(* Keep cond temps: the cond-false edge carries them too. *)
+			release_since ctx !cond_snap;
+			emit ctx (Printf.sprintf "jmp %s" l_end);
+			true
+		| [] -> comment ctx "SA-TODO: break outside loop"; false
+	end
+	| TContinue -> begin
+		match ctx.loops with
+		| (_, l_cond, entry_snap, _) :: _ ->
+			release_since ctx entry_snap;
+			emit ctx (Printf.sprintf "jmp %s" l_cond);
+			true
+		| [] -> comment ctx "SA-TODO: continue outside loop"; false
+	end
 	| TSwitch _ ->
-		comment ctx "SA-TODO(v0.5): switch (eq chain)"
+		comment ctx "SA-TODO(v0.5): switch (eq chain)";
+		false
 	| TParenthesis e1 | TMeta (_, e1) -> gen_stmt ctx e1
-	| TConst _ | TLocal _ | TBinop _ ->
-		ignore (gen_operand ctx e)
+	| TConst _ | TLocal _ | TBinop _ | TUnop _ ->
+		ignore (gen_operand ctx e);
+		false
 	| _ ->
-		comment ctx "SA-TODO: unsupported statement"
+		comment ctx ("SA-TODO: unsupported statement " ^ expr_kind e);
+		false
 
 let print_type buf mt =
 	let c =
@@ -300,8 +547,8 @@ let generate com =
 	let types = Buffer.create 1024 in
 	let ctx = {
 		com; buf = body; header;
-		next_reg = 0; next_str = 0;
-		vars = Hashtbl.create 16; live = [];
+		next_reg = 0; next_str = 0; next_label = 0;
+		vars = Hashtbl.create 16; live = []; loops = [];
 	} in
 	List.iter (print_type types) com.types;
 	let (stmts, has_args) = match com.main.main_expr with
@@ -310,12 +557,21 @@ let generate com =
 	in
 	if has_args then comment ctx "SA-TODO(v0.4): entry with args";
 	if stmts = [] then comment ctx "no haxe main entry";
-	List.iter (gen_stmt ctx) stmts;
+	(* Hoist every `stack_alloc` above all branches (PhiStateConflict). *)
+	List.iter (fun v ->
+		if not (Hashtbl.mem ctx.vars v.v_id) then begin
+			let slot = fresh ctx "var" in
+			Hashtbl.replace ctx.vars v.v_id slot;
+			emit ctx (Printf.sprintf "%s = stack_alloc 8" slot);
+			track ctx slot
+		end
+	) (List.concat (List.map (collect_vars []) stmts));
+	List.iter (fun s -> ignore (gen_stmt ctx s)) stmts;
 	release_all_except ctx None;
 	emit ctx "return 0";
 	let ch = open_out_bin com.file in
-	output_string ch "// Generated by the Haxe SA target v0.2.\n";
-	output_string ch "// Straight-line lowering only; see SA_TARGET.md.\n";
+	output_string ch "// Generated by the Haxe SA target v0.3.\n";
+	output_string ch "// Straight-line + if/while lowering; see SA_TARGET.md.\n";
 	output_string ch "@import \"sa_std/io/print.sai\"\n\n";
 	output_string ch (Buffer.contents header);
 	output_string ch "\n";

@@ -115,8 +115,11 @@ struct 20%, array 10%)。按用户指令：基础特性优先，其次 hxml，�
   bool 逻辑 + 字面量 `trace` → `@sa_print_bytes` (覆盖 function/return/arith)；
   `main_expr` 经 `entry_stmts` 解出静态 main 方法体；
   验证集 `tests/sa-demo/Arith.hx(.sa)`，`check_sa_target.py` 26/26。
-- v0.3: `if/else` + bool 逻辑 + `while`/`for` → `br`+`jmp`
-  (覆盖 if 24-99%, for 25%, while 5%)。
+- v0.3 (本提交): `if/else` + `while`/`do-while` → `br`+`jmp` (覆盖 if 24-99%)；
+  全部分支 `stack_alloc` 提升 (PhiStateConflict)，臂内临时对称释放，
+  break/continue/终结追踪 (无不可达指令)，do-while+直接跳转诚实回退；
+  优化器改写覆盖 (`+=`/`++`)； fixtures Flow/Arith 零 TODO，
+  `tools/check_sa_shape.py` 形状自检通过。
 - v0.4: 数组/Vec、struct、字符串 (`fmt` + buffer 三件套)。
 - v0.5: `switch` → `eq` 链、enum、type alias、函数调用
   (borrow/move 前缀)，fs/net (`fs.sai`/`net.sai`)。
