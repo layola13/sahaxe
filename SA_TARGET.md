@@ -141,10 +141,14 @@ struct 20%, array 10%)。按用户指令：基础特性优先，其次 hxml，�
   条件 `@import "sa_std/string.sa")；单测试寄存器复用；
   存活表路径纪律 (save/restore/keep_oldest)，Referee 全绿
   (8 fixtures 零 TODO + `sa check` 零 trap)。
-- v0.6b (本提交): `Std.string(int)` + 字符串 `+` 直接打印
+- v0.6b: `Std.string(int)` + 字符串 `+` 直接打印
   (fmt/concat 句柄经共享注册表 data/len/free，全既有契约；
   借用 `&pslot` 满足 print 合约；左折叠多段拼接)；
   typedef 转写透明；fixture StrFmt；9 fixture Referee 全绿。
+- v0.9 (本提交): class 实例构造 + 方法调用
+  (可达性发射 ctor/method/static；`this` 栈驻留；
+  `op=` 扩展到字段/元素；构造器经 `cl_constructor` 定位，
+  对照 ts 插件 trait-downgrade 惯例)；fixture ClassHx。
   消费补充的 `STRING_EQ`/`STRING_NEQ` (长度前端跟踪，
   条件 `@import "sa_std/string.sa")；单测试寄存器复用；
   存活表路径纪律 (save/restore/keep_oldest)，Referee 全绿

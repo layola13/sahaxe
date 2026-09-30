@@ -79,6 +79,8 @@ type ctx = {
 		so no branch-local alloc). Passed as `&pslot` to satisfy the
 		borrow contract of `sa_print_bytes`. *)
 	mutable pslot : string option;
+	(** Homed `this` slot for methods/constructors (None outside). *)
+	mutable this_slot : string option;
 }
 
 let fresh ctx prefix =
@@ -153,6 +155,23 @@ let mem_ty t =
 	| TAbstract ({ a_path = ([], "Int") }, _)
 	| TAbstract ({ a_path = ([], "Bool") }, _) -> "i32"
 	| _ -> "ptr"
+
+(** Integer arithmetic mnemonic (None = unsupported for v0.9 ints). *)
+let arith_mnemonic op =
+	match op with
+	| OpAdd -> Some "add" | OpSub -> Some "sub" | OpMult -> Some "mul"
+	| OpDiv -> Some "sdiv" | OpMod -> Some "srem"
+	| OpAnd -> Some "and" | OpOr -> Some "or" | OpXor -> Some "xor"
+	| OpShl -> Some "shl" | OpShr -> Some "ashr" | OpUShr -> Some "lshr"
+	| _ -> None
+
+(** Simple bases safe to evaluate twice (no side effects). *)
+let rec is_simple_base e =
+	match e.eexpr with
+	| TLocal _ -> true
+	| TConst TThis -> true
+	| TParenthesis e1 | TMeta (_, e1) | TCast (e1, _) -> is_simple_base e1
+	| _ -> false
 
 let sa_escape s =
 	let b = Buffer.create (String.length s) in
@@ -234,6 +253,10 @@ let expr_kind e =
 let sa_fun_name c cf =
 	"hx_" ^ String.concat "_" (fst c.cl_path @ [snd c.cl_path]) ^ "_" ^ cf.cf_name
 
+(** SA name for a Haxe constructor: `hx_<flat path>_new`. *)
+let sa_ctor_name c =
+	"hx_" ^ String.concat "_" (fst c.cl_path @ [snd c.cl_path]) ^ "_new"
+
 (** Scalar return annotation (None = not a plain scalar signature). *)
 let scalar_ret t =
 	match follow t with
@@ -269,12 +292,150 @@ let emittable_static cf =
 	end
 	| _ -> None
 
+(** Instance Var fields in declaration order with 8-byte offsets. *)
+let class_layout c =
+	let off = ref 0 in
+	List.filter_map (fun cf ->
+		match cf.cf_kind with
+		| Var _ ->
+			let o = !off in
+			off := o + 8;
+			Some (cf, o)
+		| _ -> None
+	) c.cl_ordered_fields
+
+let class_size c = List.length (class_layout c) * 8
+
+(** Field byte offset in the class layout, if an instance Var. *)
+let field_offset c name =
+	let rec loop = function
+		| [] -> None
+		| (cf, o) :: rest ->
+			if cf.cf_name = name then Some o else loop rest in
+	loop (class_layout c)
+
+(** True when the body contains an explicit return (constructors with
+	early returns are skipped in v0.9). *)
+let rec has_return e =
+	match e.eexpr with
+	| TReturn _ -> true
+	| TBlock el -> List.exists has_return el
+	| TIf (c, t, eo) -> has_return c || has_return t
+		|| (match eo with Some x -> has_return x | None -> false)
+	| TWhile (c, b, _) -> has_return c || has_return b
+	| TSwitch sw ->
+		has_return sw.switch_subject
+		|| List.exists (fun cs ->
+			List.exists has_return cs.case_patterns
+			|| has_return cs.case_expr) sw.switch_cases
+		|| (match sw.switch_default with Some x -> has_return x | None -> false)
+	| TTry (e1, catches) -> has_return e1
+		|| List.exists (fun (_, e2) -> has_return e2) catches
+	| TParenthesis e1 | TMeta (_, e1) | TCast (e1, _) -> has_return e1
+	| _ -> false
+
+(** An emittable constructor: plain method named `new`, scalar params,
+	body without explicit returns. *)
+let emittable_ctor c cf =
+	if cf.cf_name <> "new" then None
+	else match cf.cf_kind with
+	| Method MethNormal | Method MethInline -> begin
+		match cf.cf_expr with
+		| Some { eexpr = TFunction tf } -> begin
+			match follow cf.cf_type with
+			| TFun (args, _) ->
+				let ptys = List.map (fun (_, _, t) -> scalar_param t) args in
+				if List.exists ((=) None) ptys then None
+				else if has_return tf.tf_expr then None
+				else Some (tf,
+					List.map (function Some s -> s | None -> "") ptys)
+			| _ -> None
+		end
+		| _ -> None
+	end
+	| _ -> None
+
+(** An emittable instance method: scalar params/return like statics. *)
+let emittable_method cf =
+	match cf.cf_kind with
+	| Method MethNormal | Method MethInline -> begin
+		match cf.cf_expr with
+		| Some { eexpr = TFunction tf } -> begin
+			match follow cf.cf_type with
+			| TFun (args, ret) ->
+				let ptys = List.map (fun (_, _, t) -> scalar_param t) args in
+				if List.exists ((=) None) ptys then None
+				else (match scalar_ret ret with
+					| None -> None
+					| Some rt -> Some (tf,
+						List.map (function Some s -> s | None -> "") ptys, rt))
+			| _ -> None
+		end
+		| _ -> None
+	end
+	| _ -> None
+
+(** Reachability walk over main + helper bodies: which classes need
+	ctors, methods, statics. Constructors imply field layouts. *)
+let rec collect_classes acc e =
+	let add_ctor acc c =
+		if List.exists (fun (k, _) -> k = "ctor:" ^ s_type_path c.cl_path) acc
+		then acc
+		else ("ctor:" ^ s_type_path c.cl_path, `Ctor c) :: acc in
+	let add_method acc c cf =
+		let k = "method:" ^ s_type_path c.cl_path ^ "." ^ cf.cf_name in
+		if List.exists (fun (kk, _) -> kk = k) acc then acc
+		else (k, `Method (c, cf)) :: acc in
+	let add_static acc c cf =
+		let k = "static:" ^ s_type_path c.cl_path ^ "." ^ cf.cf_name in
+		if List.exists (fun (kk, _) -> kk = k) acc then acc
+		else (k, `Static (c, cf)) :: acc in
+	let rec walk acc e = match e.eexpr with
+		| TNew (c, _, args) ->
+			List.fold_left walk (add_ctor acc c) args
+		| TCall ({ eexpr = TField (obj, FInstance (c, _, cf)) }, args) ->
+			List.fold_left walk
+				(List.fold_left walk (add_method acc c cf) args) [obj]
+		| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, args) ->
+			List.fold_left walk (add_static acc c cf) args
+		| TField (obj, FInstance (c, _, cf)) ->
+			walk (add_method acc c cf) obj
+		| TBlock el -> List.fold_left walk acc el
+		| TVar (_, init) ->
+			(match init with Some x -> walk acc x | None -> acc)
+		| TBinop (_, a, b) -> walk (walk acc a) b
+		| TUnop (_, _, x) -> walk acc x
+		| TIf (c, t, eo) ->
+			let acc = walk (walk acc c) t in
+			(match eo with Some x -> walk acc x | None -> acc)
+		| TWhile (c, b, _) -> walk (walk acc c) b
+		| TSwitch sw ->
+			let acc = walk acc sw.switch_subject in
+			let acc = List.fold_left (fun a cs ->
+				List.fold_left walk a (cs.case_expr :: cs.case_patterns)
+			) acc sw.switch_cases in
+			(match sw.switch_default with Some x -> walk acc x | None -> acc)
+		| TTry (e1, catches) ->
+			List.fold_left (fun a (_, e2) -> walk a e2) (walk acc e1) catches
+		| TArray (a, i) -> walk (walk acc a) i
+		| TArrayDecl el -> List.fold_left walk acc el
+		| TObjectDecl fl -> List.fold_left walk acc (List.map snd fl)
+		| TCall (f, args) -> List.fold_left walk (walk acc f) args
+		| TReturn r ->
+			(match r with Some x -> walk acc x | None -> acc)
+		| TThrow x -> walk acc x
+		| TField (obj, _) -> walk acc obj
+		| TCast (x, _) | TParenthesis x | TMeta (_, x)
+		| TEnumParameter (x, _, _) | TEnumIndex x -> walk acc x
+		| _ -> acc in
+	walk acc e
+
 let new_fun_ctx com header emitted funcs = {
 	com; buf = Buffer.create 2048; header;
 	next_reg = 0; next_str = 0; next_label = 0;
 	vars = Hashtbl.create 16; live = []; loops = [];
 	emitted; funcs;
-	str_lens = Hashtbl.create 8; pslot = None;
+	str_lens = Hashtbl.create 8; pslot = None; this_slot = None;
 }
 
 (** Lazily create the entry scratch slot for buffered prints. Must be
@@ -351,6 +512,15 @@ let release_since ctx n =
 	all branches. Branch-local `stack_alloc` would trap with
 	`PhiStateConflict` (see sala 06_limitations). *)
 
+(** Field byte offset in the class layout, if an instance Var. *)
+let field_offset c name =
+	let rec loop = function
+		| [] -> None
+		| (cf, o) :: rest ->
+			if cf.cf_name = name then Some o else loop rest in
+	loop (class_layout c)
+
+(** Lower `obj.field` reads (instance Var fields only). *)
 let rec gen_operand ctx e =
 	match e.eexpr with
 	| TConst (TInt i) -> Imm (Int32.to_string i)
@@ -363,6 +533,20 @@ let rec gen_operand ctx e =
 			buffer (v0.5). Direct literal trace avoids this path. *)
 		let (name, _) = intern_string ctx s in
 		Imm ("&" ^ name)
+	| TConst TThis -> begin
+		match ctx.this_slot with
+		| None ->
+			comment ctx "SA-TODO(v0.9): this outside method";
+			Imm "0"
+		| Some slot ->
+			let r = fresh ctx "t" in
+			emit ctx (Printf.sprintf "%s = load %s+0 as ptr" r slot);
+			track ctx r;
+			Reg r
+	end
+	| TNew (c, _, args) -> gen_new ctx c args
+	| TCall ({ eexpr = TField (obj, FInstance (c, _, cf)) }, args) ->
+		gen_method_call ctx c cf obj args
 	| TField (_, FEnum (_, ef)) ->
 		(* Payload-free enum constructor = its tag index. Payload
 			enums / match extraction are a v0.6 TODO (cf. sala). *)
@@ -422,6 +606,73 @@ let rec gen_operand ctx e =
 			comment ctx ("SA-TODO(v0.2): assign-op to unhomed " ^ v.v_name);
 			Imm "0"
 	end
+	| TBinop (OpAssignOp op, ({ eexpr = TField (obj, FInstance (c, _, cf)) } as lhs), rhs)
+		when is_simple_base obj -> begin
+		match field_offset c cf.cf_name, arith_mnemonic op with
+		| Some off, Some mn ->
+			let cur = gen_operand ctx lhs in
+			let o = gen_operand ctx rhs in
+			let cs = match cur with Imm s -> s | Reg r -> r in
+			let os = match o with Imm s -> s | Reg r -> r in
+			let r = fresh ctx "t" in
+			emit ctx (Printf.sprintf "%s = %s %s, %s" r mn cs os);
+			track ctx r;
+			let bo = gen_operand ctx obj in
+			let bs = match bo with Imm s -> s | Reg r -> r in
+			emit ctx (Printf.sprintf "store %s+%d, %s as %s" bs off r (mem_ty cf.cf_type));
+			Reg r
+		| _ ->
+			comment ctx "SA-TODO(v0.9): field assign-op";
+			Imm "0"
+	end
+	| TBinop (OpAssignOp op, ({ eexpr = TField (obj, FAnon cf) } as lhs), rhs)
+		when is_simple_base obj -> begin
+		match arith_mnemonic op with
+		| Some mn ->
+			let cur = gen_operand ctx lhs in
+			let o = gen_operand ctx rhs in
+			let cs = match cur with Imm s -> s | Reg r -> r in
+			let os = match o with Imm s -> s | Reg r -> r in
+			let r = fresh ctx "t" in
+			emit ctx (Printf.sprintf "%s = %s %s, %s" r mn cs os);
+			track ctx r;
+			let bo = gen_operand ctx obj in
+			let bs = match bo with Imm s -> s | Reg r -> r in
+			let off = match anon_offset obj.etype cf.cf_name with
+				| Some o -> o | None -> 0 in
+			emit ctx (Printf.sprintf "store %s+%d, %s as i32" bs off r);
+			Reg r
+		| None ->
+			comment ctx "SA-TODO(v0.9): field assign-op";
+			Imm "0"
+	end
+	| TBinop (OpAssignOp op, ({ eexpr = TArray (base, idx) } as lhs), rhs)
+		when is_simple_base base -> begin
+		match arith_mnemonic op with
+		| Some mn ->
+			let cur = gen_operand ctx lhs in
+			let o = gen_operand ctx rhs in
+			let cs = match cur with Imm s -> s | Reg r -> r in
+			let os = match o with Imm s -> s | Reg r -> r in
+			let r = fresh ctx "t" in
+			emit ctx (Printf.sprintf "%s = %s %s, %s" r mn cs os);
+			track ctx r;
+			let bo = gen_operand ctx base in
+			let io = gen_operand ctx idx in
+			let bs = match bo with Imm s -> s | Reg r -> r in
+			let iis = match io with Imm s -> s | Reg r -> r in
+			let off = fresh ctx "off" in
+			emit ctx (Printf.sprintf "%s = mul %s, 8" off iis);
+			track ctx off;
+			let p = fresh ctx "ep" in
+			emit ctx (Printf.sprintf "%s = ptr_add %s, %s" p bs off);
+			track ctx p;
+			emit ctx (Printf.sprintf "store %s+0, %s as %s" p r (elem_ty base));
+			Reg r
+		| None ->
+			comment ctx "SA-TODO(v0.9): array assign-op";
+			Imm "0"
+	end
 	| TUnop (op, _, { eexpr = TLocal v }) -> begin
 		(* `i++` / `i--` (optimizer also rewrites `i = i + 1`). *)
 		try
@@ -451,6 +702,8 @@ let rec gen_operand ctx e =
 		gen_array_set ctx base idx rhs
 	| TBinop (OpAssign, { eexpr = TField (obj, FAnon cf) }, rhs) ->
 		gen_field_set ctx obj cf.cf_name rhs
+	| TBinop (OpAssign, { eexpr = TField (obj, FInstance (c, _, cf)) }, rhs) ->
+		gen_ifield_set ctx obj c cf rhs
 	| TObjectDecl decls -> gen_object_decl ctx decls
 	| TField (obj, FAnon cf) -> gen_field_get ctx obj cf.cf_name
 	| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, args) ->
@@ -467,9 +720,85 @@ let rec gen_operand ctx e =
 	| TArray (base, idx) -> gen_array_get ctx base idx
 	| TField (base, acc) when is_length_access base acc ->
 		gen_array_len ctx base
+	| TField (obj, FInstance (c, _, cf)) -> gen_ifield_get ctx obj c cf
 	| _ ->
 		comment ctx ("SA-TODO(v0.2/v0.3): unsupported expression " ^ expr_kind e);
 		Imm "0"
+
+and gen_ifield_get ctx obj c cf =
+	match field_offset c cf.cf_name with
+	| None ->
+		comment ctx ("SA-TODO(v0.9): non-Var field " ^ cf.cf_name);
+		Imm "0"
+	| Some off ->
+	match gen_operand ctx obj with
+	| Imm _ ->
+		comment ctx "SA-TODO(v0.9): object base must be a register";
+		Imm "0"
+	| Reg b ->
+		let ty = mem_ty cf.cf_type in
+		let r = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = load %s+%d as %s" r b off ty);
+		track ctx r;
+		Reg r
+
+(** Lower `obj.field = v` writes. *)
+and gen_ifield_set ctx obj c cf rhs =
+	match field_offset c cf.cf_name with
+	| None ->
+		comment ctx ("SA-TODO(v0.9): non-Var field " ^ cf.cf_name);
+		Imm "0"
+	| Some off ->
+	match gen_operand ctx obj with
+	| Imm _ ->
+		comment ctx "SA-TODO(v0.9): object base must be a register";
+		Imm "0"
+	| Reg b ->
+		let o = gen_operand ctx rhs in
+		let os = match o with Imm s -> s | Reg r -> r in
+		emit ctx (Printf.sprintf "store %s+%d, %s as %s" b off os (mem_ty cf.cf_type));
+		o
+
+(** Lower `new C(args)` via the emitted constructor. *)
+and gen_new ctx c args =
+	let name = sa_ctor_name c in
+	if not (Hashtbl.mem ctx.emitted name) then begin
+		comment ctx ("SA-TODO(v0.9): non-emitted ctor " ^ s_type_path c.cl_path);
+		Imm "0"
+	end else begin
+		let ss = List.map (fun a ->
+			match gen_operand ctx a with Imm s -> s | Reg r -> r) args in
+		let r = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = call @%s(%s)" r name (String.concat ", " ss));
+		track ctx r;
+		Reg r
+	end
+
+(** Lower `obj.method(args)` via the emitted method (self first). *)
+and gen_method_call ctx c cf obj args =
+	let name = sa_fun_name c cf in
+	if not (Hashtbl.mem ctx.emitted name) then begin
+		comment ctx ("SA-TODO(v0.9): non-emitted method " ^
+			s_type_path c.cl_path ^ "." ^ cf.cf_name);
+		Imm "0"
+	end else begin
+		let so = gen_operand ctx obj in
+		let ss = match so with Imm s -> s | Reg r -> r in
+		let rest = List.map (fun a ->
+			match gen_operand ctx a with Imm s -> s | Reg r -> r) args in
+		let ret = match follow cf.cf_type with
+			| TFun (_, r) -> scalar_ret r
+			| _ -> None in
+		match ret with
+		| Some "void" ->
+			emit ctx (Printf.sprintf "call @%s(%s)" name (String.concat ", " (ss :: rest)));
+			Imm "0"
+		| _ ->
+			let r = fresh ctx "t" in
+			emit ctx (Printf.sprintf "%s = call @%s(%s)" r name (String.concat ", " (ss :: rest)));
+			track ctx r;
+			Reg r
+	end
 
 (** Array layout v0.4a (fixed-size, 8-byte slots):
 	`+0` holds the length as u64, elements follow at `+8+i*8`.
@@ -1092,6 +1421,12 @@ and gen_stmt ctx e =
 	| TCall (fn, args) when callee_is_trace fn ->
 		gen_trace ctx args;
 		false
+	| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, args) ->
+		ignore (gen_call ctx c cf args);
+		false
+	| TCall ({ eexpr = TField (obj, FInstance (c, _, cf)) }, args) ->
+		ignore (gen_method_call ctx c cf obj args);
+		false
 	| TCall (fn, _) ->
 		comment ctx ("SA-TODO(v0.4): general call (" ^ callee_kind fn ^ ")");
 		false
@@ -1204,8 +1539,28 @@ and gen_stmt ctx e =
 		comment ctx ("SA-TODO: unsupported statement " ^ expr_kind e);
 		false
 
-and gen_function fctx name tf ptys ret body_stmts =
+and gen_function fctx name tf ptys ret body_stmts this_kind =
 	ignore (ensure_pslot fctx);
+	(* `this` homing: constructors allocate, methods home the self
+		param. The slot makes field access uniform with locals. *)
+	let this_ret = match this_kind with
+		| `ThisAlloc size ->
+			let obj = fresh fctx "obj" in
+			emit fctx (Printf.sprintf "%s = alloc %d" obj size);
+			track fctx obj;
+			let slot = fresh fctx "var" in
+			emit fctx (Printf.sprintf "%s = stack_alloc 8" slot);
+			emit fctx (Printf.sprintf "store %s+0, %s as ptr" slot obj);
+			fctx.this_slot <- Some slot;
+			Some obj
+		| `ThisParam ->
+			let slot = fresh fctx "var" in
+			emit fctx (Printf.sprintf "%s = stack_alloc 8" slot);
+			emit fctx (Printf.sprintf "store %s+0, self as ptr" slot);
+			track fctx "self";
+			fctx.this_slot <- Some slot;
+			None
+		| `NoThis -> None in
 	let fvars = List.combine (List.map fst tf.tf_args) ptys in
 	List.iter (fun (v, ty) ->
 		let slot = fresh fctx "var" in
@@ -1227,16 +1582,22 @@ and gen_function fctx name tf ptys ret body_stmts =
 	let term = ref false in
 	List.iter (fun s -> term := gen_stmt fctx s) body_stmts;
 	if not !term then begin
-		release_all_except fctx None;
-		(match ret with
-		| "void" -> emit fctx "return"
-		| _ -> emit fctx "return 0")
+		match this_ret with
+		| Some obj ->
+			release_all_except fctx (Some obj);
+			emit fctx (Printf.sprintf "return %s" obj)
+		| None ->
+			release_all_except fctx None;
+			(match ret with
+			| "void" -> emit fctx "return"
+			| _ -> emit fctx "return 0")
 	end;
 	let b = Buffer.create 2048 in
-	let sig_ = match fvars with
-		| [] -> ""
-		| _ -> List.map (fun (v, ty) -> Printf.sprintf "%s: %s" v.v_name ty) fvars
-			|> String.concat ", " in
+	let params = List.map (fun (v, ty) -> Printf.sprintf "%s: %s" v.v_name ty) fvars in
+	let params = match this_kind with
+		| `ThisParam -> "self: ptr" :: params
+		| _ -> params in
+	let sig_ = String.concat ", " params in
 	Buffer.add_string b (Printf.sprintf "
 @%s(%s) -> %s:
 L_ENTRY:
@@ -1302,7 +1663,7 @@ let generate com =
 		next_reg = 0; next_str = 0; next_label = 0;
 		vars = Hashtbl.create 16; live = []; loops = [];
 		emitted; funcs;
-		str_lens = Hashtbl.create 8; pslot = None;
+		str_lens = Hashtbl.create 8; pslot = None; this_slot = None;
 	} in
 	List.iter (print_type types) com.types;
 	let (stmts, has_args, main_class) = match com.main.main_expr with
@@ -1312,20 +1673,79 @@ let generate com =
 	if has_args then comment ctx "SA-TODO(v0.4): entry with args";
 	if stmts = [] then comment ctx "no haxe main entry";
 	ignore (ensure_pslot ctx);
-	(* Pre-register emittable helpers of the main class so calls
-		(including recursion and forward calls) resolve. *)
-	let helpers = match main_class with
-		| None -> []
-		| Some c ->
-			List.filter_map (fun cf ->
-				if cf.cf_name = "main" then None
-				else match emittable_static cf with
-					| None -> None
-					| Some (tf, ptys, ret) ->
-						let name = sa_fun_name c cf in
-						Hashtbl.replace emitted name ();
-						Some (name, tf, ptys, ret)
-			) c.cl_ordered_statics in
+	(* Reachability-driven emission: main-class statics (as before)
+		plus ctors/methods/statics of classes used by main, closed
+		over helper bodies (3 rounds). Pre-registration keeps
+		recursion and forward calls resolving. *)
+	let wanted_main = List.concat (List.map (collect_classes []) stmts) in
+	let is_main_class c = match main_class with
+		| Some mc -> mc == c
+		| None -> false in
+	let helpers = ref [] in
+	let register name = Hashtbl.replace emitted name () in
+	let done_keys : (string, unit) Hashtbl.t = Hashtbl.create 16 in
+	let emit_static c cf =
+		let k = "static:" ^ s_type_path c.cl_path ^ "." ^ cf.cf_name in
+		if cf.cf_name = "main" || Hashtbl.mem done_keys k then ()
+		else match emittable_static cf with
+			| None -> ()
+			| Some (tf, ptys, ret) ->
+				Hashtbl.replace done_keys k ();
+				let name = sa_fun_name c cf in
+				register name;
+				helpers := (name, tf, ptys, ret, `NoThis) :: !helpers in
+	let emit_method c cf =
+		let k = "method:" ^ s_type_path c.cl_path ^ "." ^ cf.cf_name in
+		if Hashtbl.mem done_keys k then ()
+		else match emittable_method cf with
+		| None -> ()
+		| Some (tf, ptys, ret) ->
+			Hashtbl.replace done_keys k ();
+			let name = sa_fun_name c cf in
+			register name;
+			helpers := (name, tf, ptys, ret, `ThisParam) :: !helpers in
+	let emit_ctor c =
+		let k = "ctor:" ^ s_type_path c.cl_path in
+		if Hashtbl.mem done_keys k then ()
+		else begin
+			Hashtbl.replace done_keys k ();
+			match c.cl_constructor with
+			| None -> ()
+			| Some cf -> match emittable_ctor c cf with
+				| None -> ()
+				| Some (tf, ptys) ->
+					let name = sa_ctor_name c in
+					register name;
+					helpers := (name, tf, ptys, "ptr", `ThisAlloc (class_size c)) :: !helpers
+		end in
+	(match main_class with
+	| None -> ()
+	| Some c -> List.iter (fun cf -> emit_static c cf) c.cl_ordered_statics);
+	let bodies_of = function
+		| (_, tf, _, _, _) -> match tf.tf_expr.eexpr with
+			| TBlock el -> el
+			| _ -> [tf.tf_expr] in
+	let seen_rounds = ref 0 in
+	let pending = ref wanted_main in
+	let known : (string, unit) Hashtbl.t = Hashtbl.create 16 in
+	while !pending <> [] && !seen_rounds < 3 do
+		incr seen_rounds;
+		let cur = !pending in
+		pending := [];
+		List.iter (function
+			| (_, `Ctor c) -> emit_ctor c
+			| (_, `Method (c, cf)) -> emit_method c cf
+			| (_, `Static (c, cf)) ->
+				if not (is_main_class c) then emit_static c cf
+		) cur;
+		let fresh_bodies = List.concat (List.map (fun h ->
+			List.concat (List.map (collect_classes []) (bodies_of h))
+		) !helpers) in
+		pending := List.filter (fun (k, _) ->
+			not (Hashtbl.mem known k)
+		) fresh_bodies;
+		List.iter (fun (k, _) -> Hashtbl.replace known k ()) !pending
+	done;
 	(* Hoist every `stack_alloc` above all branches (PhiStateConflict).
 		Stack slots are frame-owned: track nothing (StackEscape). *)
 	List.iter (fun v ->
@@ -1342,13 +1762,13 @@ let generate com =
 		emit ctx "return 0"
 	end;
 	(* Lower helper bodies with fresh scopes sharing header/emitted. *)
-	List.iter (fun (name, tf, ptys, ret) ->
+	List.iter (fun (name, tf, ptys, ret, this_kind) ->
 		let fctx = new_fun_ctx com header emitted funcs in
 		let body_stmts = match tf.tf_expr.eexpr with
 			| TBlock el -> el
 			| _ -> [tf.tf_expr] in
-		gen_function fctx name tf ptys ret body_stmts
-	) helpers;
+		gen_function fctx name tf ptys ret body_stmts this_kind
+	) !helpers;
 	let ch = open_out_bin com.file in
 	output_string ch "// Generated by the Haxe SA target v0.5.\n";
 	output_string ch "// + static helpers and calls; see SA_TARGET.md.\n";

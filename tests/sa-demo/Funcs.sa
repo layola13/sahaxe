@@ -94,22 +94,6 @@ L_ENDIF4:
     !t8
     return 0
 
-@hx_Funcs_add(a: i32, b: i32) -> i32:
-L_ENTRY:
-    pslot0 = stack_alloc 8
-    var1 = stack_alloc 8
-    store var1+0, a as i32
-    var2 = stack_alloc 8
-    store var2+0, b as i32
-    t3 = load var1+0 as i32
-    t4 = load var2+0 as i32
-    t5 = add t3, t4
-    !a
-    !b
-    !t3
-    !t4
-    return t5
-
 @hx_Funcs_fact(n: i32) -> i32:
 L_ENTRY:
     pslot0 = stack_alloc 8
@@ -137,3 +121,19 @@ L_ENDIF1:
     !t6
     !t7
     return t8
+
+@hx_Funcs_add(a: i32, b: i32) -> i32:
+L_ENTRY:
+    pslot0 = stack_alloc 8
+    var1 = stack_alloc 8
+    store var1+0, a as i32
+    var2 = stack_alloc 8
+    store var2+0, b as i32
+    t3 = load var1+0 as i32
+    t4 = load var2+0 as i32
+    t5 = add t3, t4
+    !a
+    !b
+    !t3
+    !t4
+    return t5
