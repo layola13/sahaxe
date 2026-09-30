@@ -176,4 +176,7 @@ struct 20%, array 10%)。按用户指令：基础特性优先，其次 hxml，�
 - v0.15: `@:generic` 单态化直通 (typer 特化后常规发射；
   裸泛型诚实延后) + `br` 统一寄存器绑定 (Imm 条件不再非法)；
   String 返回值比较诚实延后；fixture GenHx；17 fixture 全绿。
+- v0.16: `throw`→`panic` (中止等价，载荷注明丢弃) +
+  无中止源 try 体直降 (handler 注明省略，有中止源诚实回退)；
+  fixture TryHx；18 fixture 全绿。
 - 每个版本独立提交并推送，`sa_std` 缺失先补 `sci/sa_std`。

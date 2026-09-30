@@ -349,8 +349,45 @@ let field_offset c name =
 			if cf.cf_name = name then Some o else loop rest in
 	loop (class_layout c)
 
-(** True when the body contains an explicit return (constructors with
-	early returns are skipped in v0.9). *)
+(** True when the body can abort via SA `panic` (explicit `throw`
+	or I/O-trace failure paths). Such `try` blocks keep an honest
+	TODO; panic-free bodies lower straight through with the handler
+	elided as unreachable (no abort source exists in our subset). *)
+let rec try_may_abort e =
+	match e.eexpr with
+	| TThrow _ -> true
+	| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, args) ->
+		let abort_call =
+			(s_type_path c.cl_path = "sys.io.File" && cf.cf_name = "getContent")
+			|| (s_type_path c.cl_path = "Sys" && cf.cf_name = "getEnv") in
+		abort_call || List.exists try_may_abort args
+	| TBlock el -> List.exists try_may_abort el
+	| TVar (_, init) ->
+		(match init with Some x -> try_may_abort x | None -> false)
+	| TBinop (_, a, b) -> try_may_abort a || try_may_abort b
+	| TUnop (_, _, x) -> try_may_abort x
+	| TIf (c, t, eo) -> try_may_abort c || try_may_abort t
+		|| (match eo with Some x -> try_may_abort x | None -> false)
+	| TWhile (c, b, _) -> try_may_abort c || try_may_abort b
+	| TSwitch sw ->
+		try_may_abort sw.switch_subject
+		|| List.exists (fun cs ->
+			List.exists try_may_abort cs.case_patterns
+			|| try_may_abort cs.case_expr) sw.switch_cases
+		|| (match sw.switch_default with Some x -> try_may_abort x | None -> false)
+	| TTry (e1, catches) -> try_may_abort e1
+		|| List.exists (fun (_, e2) -> try_may_abort e2) catches
+	| TArray (a, i) -> try_may_abort a || try_may_abort i
+	| TArrayDecl el -> List.exists try_may_abort el
+	| TObjectDecl fl -> List.exists (fun (_, x) -> try_may_abort x) fl
+	| TField (o, _) -> try_may_abort o
+	| TCall (f, args) -> try_may_abort f || List.exists try_may_abort args
+	| TNew (_, _, args) -> List.exists try_may_abort args
+	| TReturn r ->
+		(match r with Some x -> try_may_abort x | None -> false)
+	| TParenthesis e1 | TMeta (_, e1) | TCast (e1, _)
+	| TEnumParameter (e1, _, _) | TEnumIndex e1 -> try_may_abort e1
+	| _ -> false
 let rec has_return e =
 	match e.eexpr with
 	| TReturn _ -> true
@@ -1519,6 +1556,9 @@ and collect_vars acc e =
 		let acc = collect_vars acc t in
 		(match eo with Some x -> collect_vars acc x | None -> acc)
 	| TWhile (c, b, _) -> collect_vars (collect_vars acc c) b
+	| TTry (e1, catches) ->
+		List.fold_left (fun a (_, e2) -> collect_vars a e2)
+			(collect_vars acc e1) catches
 	| TSwitch sw ->
 		let acc = collect_vars acc sw.switch_subject in
 		let acc = List.fold_left (fun a c ->
@@ -1538,6 +1578,9 @@ and has_direct_jump depth e =
 	| TBreak | TContinue -> depth = 0
 	| TWhile _ -> false
 	| TFunction _ -> false
+	| TTry (e1, catches) ->
+		has_direct_jump depth e1
+		|| List.exists (fun (_, e2) -> has_direct_jump depth e2) catches
 	| TBlock el -> List.exists (has_direct_jump depth) el
 	| TIf (c, t, eo) ->
 		has_direct_jump depth c || has_direct_jump depth t
@@ -1549,9 +1592,6 @@ and has_direct_jump depth e =
 			|| has_direct_jump depth c.case_expr) sw.switch_cases
 		|| (match sw.switch_default with
 			| Some x -> has_direct_jump depth x | None -> false)
-	| TTry (e1, catches) ->
-		has_direct_jump depth e1
-		|| List.exists (fun (_, e2) -> has_direct_jump depth e2) catches
 	| TParenthesis e1 | TMeta (_, e1) | TCast (e1, _) -> has_direct_jump depth e1
 	| _ -> false
 
@@ -1921,6 +1961,21 @@ and gen_stmt ctx e =
 	end
 	| TSwitch sw ->
 		gen_switch ctx sw
+	| TThrow _ ->
+		(* Uncaught throw aborts like panic (payload dropped, noted).
+			Caught throws need landing pads: v0.16 only lowers the
+			abort shape; try_may_abort guards try bodies. *)
+		comment ctx "SA-NOTE: throw payload dropped, abort preserved";
+		emit ctx "panic(\"haxe:throw\")";
+		true
+	| TTry (body, _) ->
+		if try_may_abort body then begin
+			comment ctx "SA-TODO(v0.16): try over aborting body";
+			false
+		end else begin
+			comment ctx "SA-NOTE: catch elided (body cannot abort)";
+			gen_stmt ctx body
+		end
 	| TParenthesis e1 | TMeta (_, e1) -> gen_stmt ctx e1
 	| TConst _ | TLocal _ | TBinop _ | TUnop _ | TArray _ | TArrayDecl _
 	| TField _ | TObjectDecl _ ->
