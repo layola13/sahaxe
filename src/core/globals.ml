@@ -50,6 +50,7 @@ type platform =
 	| Python
 	| Hl
 	| Eval
+	| Sa
 	| CustomTarget of string
 
 type compiler_version = {
@@ -121,6 +122,7 @@ let platforms = [
 	Python;
 	Hl;
 	Eval;
+	Sa;
 ]
 
 (** Expected to match `haxe.display.Display.Platform`. *)
@@ -136,6 +138,7 @@ let platform_name = function
 	| Python -> "python"
 	| Hl -> "hl"
 	| Eval -> "eval"
+	| Sa -> "sa"
 	| CustomTarget c -> c
 
 let parse_platform = function
@@ -150,6 +153,7 @@ let parse_platform = function
 	| "python" -> Python
 	| "hl" -> Hl
 	| "eval" -> Eval
+	| "sa" -> Sa
 	| p -> CustomTarget p
 
 let platform_list_help = function

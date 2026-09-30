@@ -491,6 +491,7 @@ let short_platform_name = function
 	| Python -> "py"
 	| Hl -> "hl"
 	| Eval -> "evl"
+	| Sa -> "sa"
 	| CustomTarget n -> "c_" ^ n
 
 open PlatformConfig
@@ -722,6 +723,17 @@ let get_config com =
 				ec_avoid_wrapping = false
 			};
 			pf_supports_atomics = true;
+		}
+	| Sa ->
+		{
+			default_config with
+			pf_static = false;
+			pf_capture_policy = CPLoopVars;
+			pf_uses_utf16 = false;
+			pf_supports_rest_args = true;
+			pf_exceptions = { default_config.pf_exceptions with
+				ec_avoid_wrapping = false;
+			}
 		}
 
 let memory_marker = [|Unix.time()|]

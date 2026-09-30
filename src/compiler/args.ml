@@ -48,6 +48,7 @@ let basic_args_descriptions = [
 	("Target",          ["--jvm"],              ["-jvm"],             Arg.Unit ignore, "<file>",            "generate JVM bytecode into target file");
 	("Target",          ["--python"],           ["-python"],          Arg.Unit ignore, "<file>",            "generate Python code into target file");
 	("Target",          ["--hl"],               ["-hl"],              Arg.Unit ignore, "<file>",            "generate HashLink .hl bytecode or .c code into target file");
+	("Target",          ["--sa"],               ["-sa"],              Arg.Unit ignore, "<file>",            "generate SA (safe asm) code into target file");
 	("Target",          ["--custom-target"],    ["-custom"],          Arg.Unit ignore, "<name[=path]>",     "generate code for a custom target");
 	("Target",          ["--interp"],           [],                   Arg.Unit ignore, "",                  "interpret the program using internal macro system");
 	("Target",          ["--run"],              [],                   Arg.Unit ignore, "<module> [args...]","interpret a Haxe module with command line arguments");
@@ -137,6 +138,8 @@ let parse_args args =
 			add (SetPlatform (Python, dir)); loop rest
 		| ("--hl" | "-hl") :: file :: rest ->
 			add (SetPlatform (Hl, file)); loop rest
+		| ("--sa" | "-sa") :: file :: rest ->
+			add (SetPlatform (Sa, file)); loop rest
 		| ("--custom-target" | "-custom") :: target :: rest ->
 			let name, path = try ExtString.String.split target "=" with _ -> target, "" in
 			add (SetCustomTarget (name, path)); loop rest
@@ -470,7 +473,7 @@ let to_raw_args (parsed_args : parsed_arg list) =
 	let s_platform = function
 		| Cross -> "cross" | Js -> "js" | Lua -> "lua" | Neko -> "neko"
 		| Flash -> "swf" | Php -> "php" | Cpp -> "cpp"
-		| Jvm -> "jvm" | Python -> "python" | Hl -> "hl" | Eval -> "eval"
+		| Jvm -> "jvm" | Python -> "python" | Hl -> "hl" | Sa -> "sa" | Eval -> "eval"
 		| CustomTarget name -> name
 	in
 	let s_path (p, n) = String.concat "." (p @ [n]) in

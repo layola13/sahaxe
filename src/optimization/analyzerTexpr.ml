@@ -103,7 +103,7 @@ let rec can_be_inlined e = match e.eexpr with
 	| _ -> false
 
 let target_handles_unops com = match com.platform with
-	| Lua | Python -> false
+	| Lua | Python | Sa -> false
 	| _ -> true
 
 let target_handles_assign_ops com e2 = match com.platform with
@@ -586,7 +586,7 @@ module Fusion = struct
 					{e with eexpr = TIf(e1,e2,eo)}
 				| TSwitch switch ->
 					let e1 = match com.platform with
-						| Lua | Python -> explore switch.switch_subject
+						| Lua | Python | Sa -> explore switch.switch_subject
 						| _ -> replace switch.switch_subject
 					in
 					if not !found then raise Exit;
