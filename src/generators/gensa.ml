@@ -839,6 +839,9 @@ let rec gen_operand ctx e =
 			Reg r
 	end
 	| TNew (c, _, _) when is_string_map c -> map_new_op ctx
+	| TNew (c, _, [pat; opts])
+		when s_type_path c.cl_path = "EReg" ->
+		ereg_new_op ctx pat opts
 	| TNew (c, _, args) -> gen_new ctx c args
 	| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, [])
 		when s_type_path c.cl_path = "Date" && cf.cf_name = "now" ->
@@ -846,6 +849,9 @@ let rec gen_operand ctx e =
 	| TCall ({ eexpr = TField (obj, FInstance (c, _, cf)) }, _)
 		when s_type_path c.cl_path = "Date" ->
 		date_method_op ctx obj cf
+	| TCall ({ eexpr = TField (obj, FInstance (c, _, cf)) }, [text])
+		when s_type_path c.cl_path = "EReg" && cf.cf_name = "match" ->
+		ereg_match_op ctx obj text
 	| TCall ({ eexpr = TField (obj, FInstance (c, _, cf)) }, args)
 		when is_string_map c ->
 		map_method_op ctx obj cf args e.etype
@@ -1559,6 +1565,11 @@ and materialize_owned ctx e : (string * operand) option =
 			panic_unless_ok ctx st "haxe:net-udp-recv";
 			release_now ctx st;
 			Some (buf, Reg n))
+	| TCall ({ eexpr = TField (obj, FInstance (c, _, cf)) }, [n])
+		when s_type_path c.cl_path = "EReg" && cf.cf_name = "matched" ->
+		(match gen_operand ctx n with
+		| Imm s -> ereg_matched_pair ctx obj (Imm s)
+		| Reg r -> ereg_matched_pair ctx obj (Reg r))
 	| TCall ({ eexpr = TField (obj, FInstance (c, _, cf)) }, [k])
 		when is_string_map c && cf.cf_name = "get" ->
 		(match gen_operand ctx obj, materialize_owned ctx k with
@@ -1859,6 +1870,14 @@ and gen_trace ctx args =
 				when s_type_path c.cl_path = "Sys" && cf.cf_name = "getEnv" ->
 				if trace_sys_getenv ctx n then () else
 					comment ctx "SA-TODO(v0.11): getEnv needs resolvable name"
+			| TCall ({ eexpr = TField (obj, FInstance (c, _, cf)) }, [n])
+				when s_type_path c.cl_path = "EReg" && cf.cf_name = "matched" ->
+				(match ereg_matched_pair ctx obj (gen_operand ctx n) with
+				| Some (p, lop) ->
+					let ps = (match ctx.pslot with Some x -> x | None -> ensure_pslot ctx) in
+					emit ctx (Printf.sprintf "store %s+0, %s as ptr" ps p);
+					emit ctx (Printf.sprintf "call @sa_print_bytes(&%s, %s)" ps (ops lop))
+				| None -> comment ctx "SA-TODO(v0.27): matched needs object")
 			| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, _)
 				when s_type_path c.cl_path = "Sys" && cf.cf_name = "getCwd" ->
 				ignore (trace_sys_getcwd ctx)
@@ -2459,6 +2478,10 @@ and gen_stmt ctx e =
 		| "Sys", "sleep", [s] ->
 			ignore (sys_sleep ctx s); false
 		| _ -> ignore (gen_call ctx c cf args); false)
+	| TCall ({ eexpr = TField (obj, FInstance (c, _, cf)) }, [text])
+		when s_type_path c.cl_path = "EReg" && cf.cf_name = "match" ->
+		ignore (ereg_match_op ctx obj text);
+		false
 	| TCall ({ eexpr = TField (obj, FInstance (c, _, cf)) }, args)
 		when is_string_map c ->
 		ignore (map_method_op ctx obj cf args e.etype);
@@ -3428,6 +3451,118 @@ and map_method_op ctx obj cf args use_ty =
 		comment ctx ("SA-TODO(v0.26): Map." ^ cf.cf_name);
 		Imm "0"
 
+(** v0.27 `EReg` surface: `std/EReg.hx` is extern (no bodies), so the
+	constructor and methods lower directly to `text/regex.sai`
+	contracts. Objects are heap `{re:ptr, last:ptr}` (16 bytes);
+	`match` stores the match handle, `matched` reads groups.
+	Opts support `""` and `"i"` (others honest TODO). *)
+and ereg_new_op ctx pat opts =
+	match string_operands ctx pat, string_operands ctx opts with
+	| Some (pp, pl), Some (_, _) ->
+		let fl = match opts.eexpr with
+			| TConst (TString s) ->
+				if s = "" then Some "0"
+				else if s = "i" then Some "2"
+				else None
+			| TParenthesis e1 | TMeta (_, e1) | TCast (e1, _) -> begin
+				match e1.eexpr with
+				| TConst (TString s) ->
+					if s = "" then Some "0"
+					else if s = "i" then Some "2"
+					else None
+				| _ -> None
+			end
+			| _ -> None in
+		(match fl with
+		| None ->
+			comment ctx "SA-TODO(v0.27): EReg opts other than ''/'i'";
+			Imm "0"
+		| Some fs ->
+			let h = fresh ctx "t" in
+			emit ctx (Printf.sprintf "%s = call @sa_regex_compile(%s, %s, %s)"
+				h pp pl fs);
+			track ctx h;
+			let is0 = fresh ctx "t" in
+			emit ctx (Printf.sprintf "%s = eq %s, 0" is0 h);
+			track ctx is0;
+			let l_bad = fresh_label ctx "REBAD" in
+			let l_ok = fresh_label ctx "REOK" in
+			emit ctx (Printf.sprintf "br %s -> %s, %s" is0 l_bad l_ok);
+			emit_label ctx l_bad;
+			emit ctx "panic(\"haxe:regex-compile\")";
+			emit_label ctx l_ok;
+			release_now ctx is0;
+			let obj = fresh ctx "t" in
+			emit ctx (Printf.sprintf "%s = alloc 16" obj);
+			track ctx obj;
+			emit ctx (Printf.sprintf "store %s+0, %s as ptr" obj h);
+			emit ctx (Printf.sprintf "store %s+8, 0 as ptr" obj);
+			release_now ctx h;
+			Reg obj)
+	| _ ->
+		comment ctx "SA-TODO(v0.27): EReg needs resolvable pattern";
+		Imm "0"
+
+and ereg_match_op ctx obj text =
+	match gen_operand ctx obj with
+	| Imm _ ->
+		comment ctx "SA-TODO(v0.27): EReg base must be a register";
+		Imm "0"
+	| Reg o ->
+	match string_operands ctx text with
+	| Some (tp, tl) ->
+		let re = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = load %s+0 as ptr" re o);
+		track ctx re;
+		let m = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = call @sa_regex_match(%s, %s, %s)"
+			m re tp tl);
+		track ctx m;
+		let ok = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = ne %s, 0" ok m);
+		track ctx ok;
+		let l_hit = fresh_label ctx "REHIT" in
+		let l_miss = fresh_label ctx "REMISS" in
+		let l_end = fresh_label ctx "REEND" in
+		emit ctx (Printf.sprintf "br %s -> %s, %s" ok l_hit l_miss);
+		emit_label ctx l_hit;
+		emit ctx (Printf.sprintf "store %s+8, %s as ptr" o m);
+		release_now ctx re;
+		release_now ctx m;
+		release_now ctx ok;
+		emit ctx (Printf.sprintf "%s = add 1, 0" ok);
+		track ctx ok;
+		emit ctx (Printf.sprintf "jmp %s" l_end);
+		emit_label ctx l_miss;
+		release_now ctx re;
+		release_now ctx m;
+		release_now ctx ok;
+		emit ctx (Printf.sprintf "%s = add 0, 0" ok);
+		track ctx ok;
+		emit ctx (Printf.sprintf "jmp %s" l_end);
+		emit_label ctx l_end;
+		Reg ok
+	| None ->
+		comment ctx "SA-TODO(v0.27): match needs resolvable text";
+		Imm "0"
+
+and ereg_matched_pair ctx obj idx =
+	match gen_operand ctx obj with
+	| Imm _ -> None
+	| Reg o ->
+		let last = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = load %s+8 as ptr" last o);
+		track ctx last;
+		let ii = match idx with Imm s -> s | Reg r -> r in
+		let g = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = call @sa_regex_group_ptr(%s, %s)" g last ii);
+		track ctx g;
+		let l = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = call @sa_regex_group_len(%s, %s)" l last ii);
+		track ctx l;
+		release_now ctx last;
+		Some (g, Reg l)
+
 and gen_call ctx c cf args =
 	let name = sa_fun_name c cf in
 	if not (Hashtbl.mem ctx.emitted name) then begin
@@ -3521,6 +3656,8 @@ let generate com =
 				register name;
 				helpers := (name, tf, exps, ret, `NoThis) :: !helpers in
 	let emit_method c cf =
+		if s_type_path c.cl_path = "EReg" then ()
+		else
 		let k = "method:" ^ s_type_path c.cl_path ^ "." ^ cf.cf_name in
 		if Hashtbl.mem done_keys k then ()
 		else match emittable_method cf with
@@ -3531,6 +3668,8 @@ let generate com =
 			register name;
 			helpers := (name, tf, exps, ret, `ThisParam) :: !helpers in
 	let emit_ctor c =
+		if s_type_path c.cl_path = "EReg" then ()
+		else
 		let k = "ctor:" ^ s_type_path c.cl_path in
 		if Hashtbl.mem done_keys k then ()
 		else begin
@@ -3606,6 +3745,8 @@ let generate com =
 		output_string ch "@import \"sa_std/fmt.sai\"\n";
 	if buf_has body "sa_time_" || buf_has funcs "sa_time_" then
 		output_string ch "@import \"sa_std/time.sai\"\n";
+	if buf_has body "sa_regex_" || buf_has funcs "sa_regex_" then
+		output_string ch "@import \"sa_std/text/regex.sai\"\n";
 	if buf_has body "sa_mem_copy" || buf_has funcs "sa_mem_copy" then
 		output_string ch "@import \"sa_std/core/mem.sa\"\n";
 	if buf_has body "sa_math_" || buf_has funcs "sa_math_" then
