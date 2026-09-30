@@ -124,7 +124,10 @@ struct 20%, array 10%)。按用户指令：基础特性优先，其次 hxml，�
   (f64/i32/ptr 三档，存取标注一致)；读形状照抄 `ARRAY_GET_U64`
   (`mul idx,8` + `ptr_add` + `load`)；布局 `[len:u64][elems×8]`；
   fixture Arr 零 TODO；`push`/增长留待 vec 宏 (v0.5)。
-- v0.4b: struct/对象 (`#def` 偏移 + `alloc`，字段读写)，字符串变量。
+- v0.4b (本提交): 匿名结构字面量 + 字段读写 (按名排序布局，
+  声明/使用一致；类实例需构造调用，留 v0.5)；字符串值操作数
+  (`&CONST` 直存)；数组元素内字段写保护性回退；
+  fixtures Obj/ObjArr 零 TODO (堆对象经数组存活得到覆盖)。
 - v0.5: `switch` → `eq` 链、enum、type alias、函数调用
   (borrow/move 前缀)，fs/net (`fs.sai`/`net.sai`)。
 - v0.6: class、泛型单态化、异常 `panic` → `T!`/`?`。
