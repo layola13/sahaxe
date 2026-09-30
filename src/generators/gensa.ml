@@ -521,6 +521,136 @@ let field_offset c name =
 	loop (class_layout c)
 
 (** Lower `obj.field` reads (instance Var fields only). *)
+(** v0.11 sys surface: `sys.io.File`, `Sys`, `sys.FileSystem` lowered
+	to existing `sci/sa_std` fs/env contracts only (macros + externs,
+	zero new ABI). Statement/trace-oriented like v0.6b; stored
+	computed results and sockets stay TODOs. *)
+let sys_save_content ctx p content =
+	match string_operands ctx p, string_operands ctx content with
+	| Some (pp, pl), Some (bp, bl) ->
+		let st = fresh ctx "t" in
+		emit ctx (Printf.sprintf "EXPAND FS_WRITE_FILE %s, %s, %s, %s, %s"
+			st pp pl bp bl);
+		track ctx st;
+		release_now ctx st;
+		true
+	| _ ->
+		comment ctx "SA-TODO(v0.11): saveContent needs resolvable strings";
+		false
+
+let sys_surface_stmt ctx c cf args : bool =
+	match s_type_path c.cl_path, cf.cf_name, args with
+	| "sys.io.File", "saveContent", [_; _] ->
+		(match args with
+		| [p; content] -> sys_save_content ctx p content
+		| _ -> false)
+	| _ -> false
+
+(** `sys.FileSystem.exists(path)` as a plain i32 operand.
+	`&path` borrow goes through the entry scratch slot. *)
+let sys_exists_op ctx path =
+	match string_operands ctx path with
+	| Some (pp, pl) ->
+		let ps = ensure_pslot ctx in
+		emit ctx (Printf.sprintf "store %s+0, %s as ptr" ps pp);
+		let r = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = call @sa_std_fs_exists(&%s, %s)" r ps pl);
+		track ctx r;
+		Some (Reg r)
+	| None ->
+		comment ctx "SA-TODO(v0.11): exists needs resolvable path";
+		None
+
+let sys_surface_operand ctx c cf args =
+	match s_type_path c.cl_path, cf.cf_name, args with
+	| "sys.io.File", "saveContent", [p; content] ->
+		if sys_save_content ctx p content then Some (Imm "0") else None
+	| "sys.FileSystem", "exists", [path] -> sys_exists_op ctx path
+	| _ -> None
+
+(** Trace `sys.io.File.getContent(path)` directly: read handle,
+	print, free; I/O failure panics loudly (no silent garbage). *)
+let trace_fs_get_content ctx p =
+	match string_operands ctx p with
+	| Some (pp, pl) ->
+		let st = fresh ctx "t" in
+		let buf = fresh ctx "t" in
+		emit ctx (Printf.sprintf
+			"EXPAND FS_READ_TO_STRING %s, %s, %s, %s, 1048576" st buf pp pl);
+		track ctx st;
+		track ctx buf;
+		let ok = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = eq %s, 0" ok st);
+		track ctx ok;
+		let l_ok = fresh_label ctx "FSOK" in
+		let l_fail = fresh_label ctx "FSFAIL" in
+		let l_end = fresh_label ctx "FSEND" in
+		emit ctx (Printf.sprintf "br %s -> %s, %s" ok l_ok l_fail);
+		emit_label ctx l_ok;
+		let ps = ensure_pslot ctx in
+		let d = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = call @sa_fs_read_buffer_data(%s)" d buf);
+		track ctx d;
+		let ln = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = call @sa_fs_read_buffer_len(%s)" ln buf);
+		track ctx ln;
+		emit ctx (Printf.sprintf "store %s+0, %s as ptr" ps d);
+		emit ctx (Printf.sprintf "call @sa_print_bytes(&%s, %s)" ps ln);
+		let f = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = call @sa_fs_read_buffer_free(^%s)" f buf);
+		track ctx f;
+		forget ctx buf;
+		release_now ctx st;
+		release_now ctx ok;
+		release_now ctx d;
+		release_now ctx ln;
+		release_now ctx f;
+		emit ctx (Printf.sprintf "jmp %s" l_end);
+		emit_label ctx l_fail;
+		emit ctx "panic(\"haxe:fs-read\")";
+		emit_label ctx l_end;
+		true
+	| None -> false
+
+(** Trace `Sys.getEnv(name)` directly; missing variable panics. *)
+let trace_sys_getenv ctx n =
+	match string_operands ctx n with
+	| Some (kp, kl) ->
+		let h = fresh ctx "h" in
+		emit ctx (Printf.sprintf "%s = call @sa_env_get(%s, %s)" h kp kl);
+		track ctx h;
+		let is0 = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = eq %s, 0" is0 h);
+		track ctx is0;
+		let l_miss = fresh_label ctx "ENVMISS" in
+		let l_hit = fresh_label ctx "ENVHIT" in
+		let l_end = fresh_label ctx "ENVEND" in
+		emit ctx (Printf.sprintf "br %s -> %s, %s" is0 l_miss l_hit);
+		emit_label ctx l_miss;
+		emit ctx "panic(\"haxe:env-missing\")";
+		emit_label ctx l_hit;
+		let ps = ensure_pslot ctx in
+		let d = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = call @sa_env_buffer_data(%s)" d h);
+		track ctx d;
+		let ln = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = call @sa_env_buffer_len(%s)" ln h);
+		track ctx ln;
+		emit ctx (Printf.sprintf "store %s+0, %s as ptr" ps d);
+		emit ctx (Printf.sprintf "call @sa_print_bytes(&%s, %s)" ps ln);
+		let f = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = call @sa_env_buffer_free(^%s)" f h);
+		track ctx f;
+		forget ctx h;
+		release_now ctx is0;
+		release_now ctx d;
+		release_now ctx ln;
+		release_now ctx f;
+		emit ctx (Printf.sprintf "jmp %s" l_end);
+		emit_label ctx l_end;
+		true
+	| None -> false
+
 let rec gen_operand ctx e =
 	match e.eexpr with
 	| TConst (TInt i) -> Imm (Int32.to_string i)
@@ -707,7 +837,9 @@ let rec gen_operand ctx e =
 	| TObjectDecl decls -> gen_object_decl ctx decls
 	| TField (obj, FAnon cf) -> gen_field_get ctx obj cf.cf_name
 	| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, args) ->
-		gen_call ctx c cf args
+		(match sys_surface_operand ctx c cf args with
+		| Some o -> o
+		| None -> gen_call ctx c cf args)
 	| TBinop (op, e1, e2) -> gen_binop ctx op e1 e2 e.etype
 	| TParenthesis e1 | TMeta (_, e1) -> gen_operand ctx e1
 	| TCast (e1, _) -> gen_operand ctx e1
@@ -1108,8 +1240,19 @@ and gen_trace ctx args =
 	if gen_trace_lit ctx args then ()
 	else match args with
 	| a :: _ ->
-		if trace_string_value ctx a then () else
-			comment ctx "SA-TODO(v0.6): trace needs printable value"
+		if trace_string_value ctx a then () else begin
+			match a.eexpr with
+			| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, p :: _)
+				when s_type_path c.cl_path = "sys.io.File" && cf.cf_name = "getContent" ->
+				if trace_fs_get_content ctx p then () else
+					comment ctx "SA-TODO(v0.11): getContent needs resolvable path"
+			| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, n :: _)
+				when s_type_path c.cl_path = "Sys" && cf.cf_name = "getEnv" ->
+				if trace_sys_getenv ctx n then () else
+					comment ctx "SA-TODO(v0.11): getEnv needs resolvable name"
+			| _ ->
+				comment ctx "SA-TODO(v0.6): trace needs printable value"
+		end
 	| [] -> ()
 
 and entry_stmts e =
@@ -1422,8 +1565,8 @@ and gen_stmt ctx e =
 		gen_trace ctx args;
 		false
 	| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, args) ->
-		ignore (gen_call ctx c cf args);
-		false
+		if sys_surface_stmt ctx c cf args then false
+		else (ignore (gen_call ctx c cf args); false)
 	| TCall ({ eexpr = TField (obj, FInstance (c, _, cf)) }, args) ->
 		ignore (gen_method_call ctx c cf obj args);
 		false
@@ -1778,6 +1921,11 @@ let generate com =
 		output_string ch "@import \"sa_std/string.sa\"\n";
 	if buf_has body "sa_fmt_" || buf_has funcs "sa_fmt_" then
 		output_string ch "@import \"sa_std/fmt.sai\"\n";
+	if buf_has body "FS_" || buf_has funcs "FS_"
+	|| buf_has body "sa_fs_" || buf_has funcs "sa_fs_" then
+		output_string ch "@import \"sa_std/fs.sa\"\n";
+	if buf_has body "sa_env_" || buf_has funcs "sa_env_" then
+		output_string ch "@import \"sa_std/env.sai\"\n";
 	output_string ch "\n";
 	output_string ch (Buffer.contents header);
 	output_string ch "\n";

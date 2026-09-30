@@ -160,4 +160,7 @@ struct 20%, array 10%)。按用户指令：基础特性优先，其次 hxml，�
 - v0.10 : for-in 协议 — 范围/array 由 typer 化为索引
   while (零新增代码)，自定义迭代器走 v0.9 方法机制；
   fixture ForLoop (三形状) 零 TODO + Referee 全绿。
+- v0.11: sys 对接 (`File.saveContent/getContent`, `FileSystem.exists`,
+  `Sys.getEnv`) 经既有 fs/env 契约 (宏+extern)；失败 loud-panic；
+  fixture FsDemo；socket 诚实延后。
 - 每个版本独立提交并推送，`sa_std` 缺失先补 `sci/sa_std`。
