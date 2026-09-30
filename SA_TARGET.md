@@ -151,5 +151,6 @@ struct 20%, array 10%)。按用户指令：基础特性优先，其次 hxml，�
   (8 fixtures 零 TODO + `sa check` 零 trap)。
 - v0.7 (本提交): hxml 工程互通 — `--sa` 走通用管线，
   hxml/`--next` 批处理零代码可用 (fixture `tests/sa-demo/build.hxml`)。
-- v0.8: 宏 (`--macro`) 在 SA 目标下的求值与展开。
+- v0.8 (本提交): 宏互通 — 宏在 Eval 上下文求值，与 codegen 无关，
+  零代码可用 (fixture `tests/sa-demo/Mac.hx`, expr 宏展开后正常降)。
 - 每个版本独立提交并推送，`sa_std` 缺失先补 `sci/sa_std`。
