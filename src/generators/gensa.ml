@@ -827,6 +827,12 @@ let rec gen_operand ctx e =
 			Reg r
 	end
 	| TNew (c, _, args) -> gen_new ctx c args
+	| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, [])
+		when s_type_path c.cl_path = "Date" && cf.cf_name = "now" ->
+		date_now_op ctx
+	| TCall ({ eexpr = TField (obj, FInstance (c, _, cf)) }, _)
+		when s_type_path c.cl_path = "Date" ->
+		date_method_op ctx obj cf
 	| TCall ({ eexpr = TField (obj, FInstance (c, _, cf)) }, args) ->
 		gen_method_call ctx c cf obj args
 	| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, args)
@@ -2865,6 +2871,74 @@ and net_udp_send_op ctx s_e data_e =
 		Reg n
 	| None ->
 		comment ctx "SA-TODO(v0.23): udp send needs resolvable data";
+		Imm "0"
+
+(** v0.25 `Date` surface: `std/Date.hx` is extern (no bodies), so
+	methods lower directly to `sa_time_*` contracts. Date objects are
+	heap `{t:f64 millis}` (field +0), built by `now()`. *)
+and date_now_op ctx =
+	let m = fresh ctx "t" in
+	emit ctx (Printf.sprintf "%s = call @sa_time_unix_ms()" m);
+	track ctx m;
+	let f = fresh ctx "t" in
+	emit ctx (Printf.sprintf "%s = sitofp %s" f m);
+	track ctx f;
+	let obj = fresh ctx "obj" in
+	emit ctx (Printf.sprintf "%s = alloc %d" obj 8);
+	track ctx obj;
+	emit ctx (Printf.sprintf "store %s+0, %s as f64" obj f);
+	release_now ctx m;
+	release_now ctx f;
+	Reg obj
+
+and date_field_ms ctx obj =
+	match gen_operand ctx obj with
+	| Imm _ ->
+		comment ctx "SA-TODO(v0.25): Date base must be a register";
+		None
+	| Reg b ->
+		let t = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = load %s+0 as f64" t b);
+		track ctx t;
+		let m = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = fptosi %s" m t);
+		track ctx m;
+		release_now ctx t;
+		Some m
+
+and date_getter_op ctx obj sai =
+	match date_field_ms ctx obj with
+	| None -> Imm "0"
+	| Some m ->
+		let r = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = call @%s(%s)" r sai m);
+		track ctx r;
+		release_now ctx m;
+		Reg r
+
+and date_method_op ctx obj cf =
+	match cf.cf_name with
+	| "getTime" ->
+		(match gen_operand ctx obj with
+		| Imm _ ->
+			comment ctx "SA-TODO(v0.25): Date base must be a register";
+			Imm "0"
+		| Reg b ->
+			let r = fresh ctx "t" in
+			emit ctx (Printf.sprintf "%s = load %s+0 as f64" r b);
+			track ctx r;
+			Reg r)
+	| ("getFullYear" | "getMonth" | "getDate" | "getHours" | "getMinutes" | "getSeconds" as g) ->
+		let sai = match g with
+			| "getFullYear" -> "sa_time_get_full_year"
+			| "getMonth" -> "sa_time_get_month"
+			| "getDate" -> "sa_time_get_date"
+			| "getHours" -> "sa_time_get_hours"
+			| "getMinutes" -> "sa_time_get_minutes"
+			| _ -> "sa_time_get_seconds" in
+		date_getter_op ctx obj sai
+	| _ ->
+		comment ctx ("SA-TODO(v0.25): Date." ^ cf.cf_name);
 		Imm "0"
 
 and gen_call ctx c cf args =
