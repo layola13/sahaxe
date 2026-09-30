@@ -104,6 +104,16 @@ let is_float_t t =
 	| TInst ({ cl_path = ([], "Float") }, _) -> true
 	| _ -> false
 
+(** Memory annotation for homed slots: Float -> f64, Int/Bool -> i32,
+	everything else (Array/String/objects) -> ptr. Deterministic per
+	type so matching load/store pairs always agree. *)
+let mem_ty t =
+	if is_float_t t then "f64"
+	else match follow t with
+	| TAbstract ({ a_path = ([], "Int") }, _)
+	| TAbstract ({ a_path = ([], "Bool") }, _) -> "i32"
+	| _ -> "ptr"
+
 let sa_escape s =
 	let b = Buffer.create (String.length s) in
 	String.iter (fun c ->
@@ -137,7 +147,7 @@ let rec gen_operand ctx e =
 		try
 			let slot = Hashtbl.find ctx.vars v.v_id in
 			let r = fresh ctx "t" in
-			let ty = if is_float_t v.v_type then "f64" else "i32" in
+			let ty = mem_ty v.v_type in
 			emit ctx (Printf.sprintf "%s = load %s+0 as %s" r slot ty);
 			track ctx r;
 			Reg r
@@ -149,7 +159,7 @@ let rec gen_operand ctx e =
 		try
 			let slot = Hashtbl.find ctx.vars v.v_id in
 			let op = gen_operand ctx rhs in
-			let ty = if is_float_t v.v_type then "f64" else "i32" in
+			let ty = mem_ty v.v_type in
 			let os = match op with Imm s -> s | Reg r -> r in
 			emit ctx (Printf.sprintf "store %s+0, %s as %s" slot os ty);
 			op
@@ -161,7 +171,7 @@ let rec gen_operand ctx e =
 		(* Optimizer desugar: `x = x + e` arrives as OpAssignOp. *)
 		try
 			let slot = Hashtbl.find ctx.vars v.v_id in
-			let ty = if is_float_t v.v_type then "f64" else "i32" in
+			let ty = mem_ty v.v_type in
 			let cur = fresh ctx "t" in
 			emit ctx (Printf.sprintf "%s = load %s+0 as %s" cur slot ty);
 			track ctx cur;
@@ -192,7 +202,7 @@ let rec gen_operand ctx e =
 		(* `i++` / `i--` (optimizer also rewrites `i = i + 1`). *)
 		try
 			let slot = Hashtbl.find ctx.vars v.v_id in
-			let ty = if is_float_t v.v_type then "f64" else "i32" in
+			let ty = mem_ty v.v_type in
 			let cur = fresh ctx "t" in
 			emit ctx (Printf.sprintf "%s = load %s+0 as %s" cur slot ty);
 			track ctx cur;
@@ -213,12 +223,100 @@ let rec gen_operand ctx e =
 			comment ctx ("SA-TODO: unop on unhomed " ^ v.v_name);
 			Imm "0"
 	end
+	| TBinop (OpAssign, { eexpr = TArray (base, idx) }, rhs) ->
+		gen_array_set ctx base idx rhs
 	| TBinop (op, e1, e2) -> gen_binop ctx op e1 e2 e.etype
 	| TParenthesis e1 | TMeta (_, e1) -> gen_operand ctx e1
 	| TCast (e1, _) -> gen_operand ctx e1
+	| TArrayDecl elems -> gen_array_decl ctx elems
+	| TArray (base, idx) -> gen_array_get ctx base idx
+	| TField (base, acc) when is_length_access base acc ->
+		gen_array_len ctx base
 	| _ ->
 		comment ctx "SA-TODO(v0.2/v0.3): unsupported expression";
 		Imm "0"
+
+(** Array layout v0.4a (fixed-size, 8-byte slots):
+	`+0` holds the length as u64, elements follow at `+8+i*8`.
+	The read shape mirrors `ARRAY_GET_U64` in `sci/sa_std/array.sa`
+	(`off = mul idx, 8; ptr = ptr_add base, off; load ptr+0`).
+	`push`/growth needs the vec macros and is a v0.5 TODO. *)
+(** Element annotation from the Array type parameter (default i32). *)
+and elem_ty base =
+	match follow base.etype with
+	| TInst ({ cl_path = ([], "Array") }, [t]) -> mem_ty t
+	| _ -> "i32"
+
+and gen_array_decl ctx elems =
+	let n = List.length elems in
+	let arr = fresh ctx "arr" in
+	emit ctx (Printf.sprintf "%s = alloc %d" arr ((n + 1) * 8));
+	track ctx arr;
+	emit ctx (Printf.sprintf "store %s+0, %d as u64" arr n);
+	List.iteri (fun i ee ->
+		let o = gen_operand ctx ee in
+		let os = match o with Imm s -> s | Reg r -> r in
+		let ty = mem_ty ee.etype in
+		emit ctx (Printf.sprintf "store %s+%d, %s as %s" arr ((i + 1) * 8) os ty)
+	) elems;
+	Reg arr
+
+and gen_array_ptr ctx base idx =
+	let ob = gen_operand ctx base in
+	let oi = gen_operand ctx idx in
+	match ob with
+	| Imm _ ->
+		comment ctx "SA-TODO(v0.4): array base must be a register";
+		None
+	| Reg b ->
+		let si = match oi with Imm s -> s | Reg r -> r in
+		let off = fresh ctx "off" in
+		emit ctx (Printf.sprintf "%s = mul %s, 8" off si);
+		track ctx off;
+		let p = fresh ctx "ep" in
+		emit ctx (Printf.sprintf "%s = ptr_add %s, %s" p b off);
+		track ctx p;
+		Some p
+
+and gen_array_get ctx base idx =
+	match gen_array_ptr ctx base idx with
+	| None -> Imm "0"
+	| Some p ->
+		let r = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = load %s+0 as %s" r p (elem_ty base));
+		track ctx r;
+		Reg r
+
+and gen_array_set ctx base idx rhs =
+	match gen_array_ptr ctx base idx with
+	| None -> Imm "0"
+	| Some p ->
+		let o = gen_operand ctx rhs in
+		let os = match o with Imm s -> s | Reg r -> r in
+		emit ctx (Printf.sprintf "store %s+0, %s as %s" p os (elem_ty base));
+		o
+
+and is_length_access base acc =
+	(match follow base.etype with
+	| TInst ({ cl_path = ([], "Array") }, _) -> true
+	| _ -> false)
+	&& (match acc with
+	| FDynamic "length" -> true
+	| FInstance (_, _, f) when f.cf_name = "length" -> true
+	| FAnon f when f.cf_name = "length" -> true
+	| FStatic (_, f) when f.cf_name = "length" -> true
+	| _ -> false)
+
+and gen_array_len ctx base =
+	match gen_operand ctx base with
+	| Imm _ ->
+		comment ctx "SA-TODO(v0.4): array base must be a register";
+		Imm "0"
+	| Reg b ->
+		let r = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = load %s+0 as u64" r b);
+		track ctx r;
+		Reg r
 
 and gen_binop ctx op e1 e2 etype =
 	let float_ctx = is_float_t e1.etype || is_float_t e2.etype || is_float_t etype in
@@ -409,7 +507,7 @@ let rec gen_stmt ctx e =
 				track ctx s;
 				s
 		in
-		let ty = if is_float_t v.v_type then "f64" else "i32" in
+		let ty = mem_ty v.v_type in
 		let valu = match init with
 			| Some ie -> begin match gen_operand ctx ie with
 				| Imm s -> s | Reg r -> r end
@@ -523,7 +621,7 @@ let rec gen_stmt ctx e =
 		comment ctx "SA-TODO(v0.5): switch (eq chain)";
 		false
 	| TParenthesis e1 | TMeta (_, e1) -> gen_stmt ctx e1
-	| TConst _ | TLocal _ | TBinop _ | TUnop _ ->
+	| TConst _ | TLocal _ | TBinop _ | TUnop _ | TArray _ | TArrayDecl _ | TField _ ->
 		ignore (gen_operand ctx e);
 		false
 	| _ ->

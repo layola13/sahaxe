@@ -120,7 +120,11 @@ struct 20%, array 10%)。按用户指令：基础特性优先，其次 hxml，�
   break/continue/终结追踪 (无不可达指令)，do-while+直接跳转诚实回退；
   优化器改写覆盖 (`+=`/`++`)； fixtures Flow/Arith 零 TODO，
   `tools/check_sa_shape.py` 形状自检通过。
-- v0.4: 数组/Vec、struct、字符串 (`fmt` + buffer 三件套)。
+- v0.4a (本提交): 定长数组字面量/索引读写/`.length` + `mem_ty`
+  (f64/i32/ptr 三档，存取标注一致)；读形状照抄 `ARRAY_GET_U64`
+  (`mul idx,8` + `ptr_add` + `load`)；布局 `[len:u64][elems×8]`；
+  fixture Arr 零 TODO；`push`/增长留待 vec 宏 (v0.5)。
+- v0.4b: struct/对象 (`#def` 偏移 + `alloc`，字段读写)，字符串变量。
 - v0.5: `switch` → `eq` 链、enum、type alias、函数调用
   (borrow/move 前缀)，fs/net (`fs.sai`/`net.sai`)。
 - v0.6: class、泛型单态化、异常 `panic` → `T!`/`?`。
