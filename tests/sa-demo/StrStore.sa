@@ -3,6 +3,7 @@
 @import "sa_std/io/print.sai"
 @import "sa_std/string.sa"
 @import "sa_std/fmt.sai"
+@import "sa_std/core/mem.sa"
 
 @const STR_0 = utf8:"foo"
 @const STR_1 = utf8:"bar"

@@ -273,6 +273,18 @@ let sa_ctor_name c =
 
 (** Scalar return annotation (None = not a plain scalar signature).
 	Enums pass as opaque object pointers. *)
+(** Map value annotation: unwrap Null, then mem. `get` on missing
+	keys yields zero-words per the documented convention. *)
+let map_val_ty t =
+	let rec deref x = match follow x with
+		| TAbstract ({ a_path = ([], "Null") }, [inner]) -> deref inner
+		| y -> y in
+	mem_ty (deref t)
+
+(** True for the StringMap implementation class. *)
+let is_string_map c =
+	s_type_path c.cl_path = "haxe.ds.StringMap"
+
 let scalar_ret t =
 	match follow t with
 	| TAbstract ({ a_path = ([], "Int") }, _)
@@ -826,6 +838,7 @@ let rec gen_operand ctx e =
 			track ctx r;
 			Reg r
 	end
+	| TNew (c, _, _) when is_string_map c -> map_new_op ctx
 	| TNew (c, _, args) -> gen_new ctx c args
 	| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, [])
 		when s_type_path c.cl_path = "Date" && cf.cf_name = "now" ->
@@ -833,6 +846,9 @@ let rec gen_operand ctx e =
 	| TCall ({ eexpr = TField (obj, FInstance (c, _, cf)) }, _)
 		when s_type_path c.cl_path = "Date" ->
 		date_method_op ctx obj cf
+	| TCall ({ eexpr = TField (obj, FInstance (c, _, cf)) }, args)
+		when is_string_map c ->
+		map_method_op ctx obj cf args e.etype
 	| TCall ({ eexpr = TField (obj, FInstance (c, _, cf)) }, args) ->
 		gen_method_call ctx c cf obj args
 	| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, args)
@@ -983,6 +999,13 @@ let rec gen_operand ctx e =
 		let os = match o with Imm s -> s | Reg r -> r in
 		let r = fresh ctx "t" in
 		emit ctx (Printf.sprintf "%s = fneg %s" r os);
+		track ctx r;
+		Reg r
+	| TUnop (Not, _, e1) ->
+		let o = gen_operand ctx e1 in
+		let os = match o with Imm s -> s | Reg r -> r in
+		let r = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = eq %s, 0" r os);
 		track ctx r;
 		Reg r
 	| TUnop (op, _, { eexpr = TLocal v }) -> begin
@@ -1489,7 +1512,7 @@ and gen_math_call ctx cf args =
 		Imm "0"
 
 and gen_string_eq ctx op e1 e2 =
-	match string_pair_or_call ctx e1, string_pair_or_call ctx e2 with
+	match materialize_owned ctx e1, materialize_owned ctx e2 with
 	| Some (p1, l1), Some (p2, l2) ->
 		let r = fresh ctx "t" in
 		let mn = if op = OpEq then "STRING_EQ" else "STRING_NEQ" in
@@ -1536,6 +1559,15 @@ and materialize_owned ctx e : (string * operand) option =
 			panic_unless_ok ctx st "haxe:net-udp-recv";
 			release_now ctx st;
 			Some (buf, Reg n))
+	| TCall ({ eexpr = TField (obj, FInstance (c, _, cf)) }, [k])
+		when is_string_map c && cf.cf_name = "get" ->
+		(match gen_operand ctx obj, materialize_owned ctx k with
+		| Reg m, Some (kp, klop) ->
+			let (v0, v1) = map_get_pair ctx m kp (ops klop) (map_val_ty e.etype) in
+			Some (v0, v1)
+		| _ ->
+			comment ctx "SA-TODO(v0.26): map get needs map register";
+			None)
 	| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, _)
 		when s_type_path c.cl_path = "Sys" && cf.cf_name = "getCwd" ->
 		materialize_cwd ctx
@@ -1683,7 +1715,7 @@ and trace_string_value ctx e : bool =
 	| TBinop (OpAdd, l, r) when is_string_t e.etype ->
 		trace_concat ctx l r
 	| TParenthesis e1 | TMeta (_, e1) | TCast (e1, _) -> trace_string_value ctx e1
-	| _ -> match string_pair_or_call ctx e with
+	| _ -> match materialize_owned ctx e with
 		| Some (p, l) ->
 			let ps = (match ctx.pslot with Some s -> s | None -> ensure_pslot ctx) in
 			emit ctx (Printf.sprintf "store %s+0, %s as ptr" ps p);
@@ -1756,7 +1788,7 @@ and trace_concat ctx l r =
 		| TParenthesis e1 | TMeta (_, e1) | TCast (e1, _) -> flatten acc e1
 		| _ -> acc @ [e] in
 	let parts = flatten (flatten [] l) r in
-	let resolved = List.map (string_pair_or_call ctx) parts in
+	let resolved = List.map (materialize_owned ctx) parts in
 	if List.length parts < 2 || List.exists ((=) None) resolved then begin
 		comment ctx "SA-TODO(v0.6): concat needs resolvable sides";
 		false
@@ -2170,7 +2202,7 @@ and gen_switch ctx sw =
 		false
 	end else begin
 		let snap_all = snapshot ctx in
-		let subj_str = if str_mode then string_pair_or_call ctx sw.switch_subject else None in
+		let subj_str = if str_mode then materialize_owned ctx sw.switch_subject else None in
 		if str_mode && subj_str = None then begin
 			comment ctx "SA-TODO(v0.6): string switch needs tracked lengths";
 			false
@@ -2427,6 +2459,10 @@ and gen_stmt ctx e =
 		| "Sys", "sleep", [s] ->
 			ignore (sys_sleep ctx s); false
 		| _ -> ignore (gen_call ctx c cf args); false)
+	| TCall ({ eexpr = TField (obj, FInstance (c, _, cf)) }, args)
+		when is_string_map c ->
+		ignore (map_method_op ctx obj cf args e.etype);
+		false
 	| TCall ({ eexpr = TField (obj, FInstance (c, _, cf)) }, args) ->
 		ignore (gen_method_call ctx c cf obj args);
 		false
@@ -2657,7 +2693,7 @@ and splice_args ctx cf args : string list option =
 		| [], [] -> Some (List.rev acc)
 		| a :: rest_a, t :: rest_t ->
 			if is_string_t t then
-				(match string_pair_or_call ctx a with
+				(match materialize_owned ctx a with
 				| Some (p, l) -> loop (ops l :: p :: acc) (rest_a, rest_t)
 				| None -> None)
 			else begin
@@ -2941,6 +2977,457 @@ and date_method_op ctx obj cf =
 		comment ctx ("SA-TODO(v0.25): Date." ^ cf.cf_name);
 		Imm "0"
 
+(** v0.26 `haxe.ds.StringMap` lowered directly to heap structure
+	(zero new ABI, no Haxe bodies needed — the class is bare-generic).
+	Layout: header `[kptr+0][vptr+8][len+16][cap+24]`; keys and values
+	are 16-byte pairs. Linear scan with `STRING_EQ`; growth by
+	doubling. `get` on missing keys yields `(0, 0)` (documented
+	zero-value convention; use `exists` for presence). Loop index
+	lives in a stack slot (never a redefined reg). *)
+and map_new_op ctx =
+	let cap = 4 in
+	let kptr = fresh ctx "t" in
+	emit ctx (Printf.sprintf "%s = alloc %d" kptr (cap * 16));
+	track ctx kptr;
+	let vptr = fresh ctx "t" in
+	emit ctx (Printf.sprintf "%s = alloc %d" vptr (cap * 8 * 2));
+	track ctx vptr;
+	let m = fresh ctx "t" in
+	emit ctx (Printf.sprintf "%s = alloc 32" m);
+	track ctx m;
+	emit ctx (Printf.sprintf "store %s+0, %s as ptr" m kptr);
+	emit ctx (Printf.sprintf "store %s+8, %s as ptr" m vptr);
+	emit ctx (Printf.sprintf "store %s+16, 0 as u64" m);
+	emit ctx (Printf.sprintf "store %s+24, %d as u64" m cap);
+	release_now ctx kptr;
+	release_now ctx vptr;
+	Reg m
+
+(** Scan loop over entries. `hit_body` receives (kptr, vptr, len) plus
+	a `clean` closure releasing iteration temps; it must release the
+	three header regs itself and jump out (never fall through). *)
+and map_scan_emit ctx map kp kl hit_body =
+	let kptr = fresh ctx "t" in
+	emit ctx (Printf.sprintf "%s = load %s+0 as ptr" kptr map);
+	track ctx kptr;
+	let vptr = fresh ctx "t" in
+	emit ctx (Printf.sprintf "%s = load %s+8 as ptr" vptr map);
+	track ctx vptr;
+	let len = fresh ctx "t" in
+	emit ctx (Printf.sprintf "%s = load %s+16 as u64" len map);
+	track ctx len;
+	let isl = fresh ctx "var" in
+	emit ctx (Printf.sprintf "%s = stack_alloc 8" isl);
+	emit ctx (Printf.sprintf "store %s+0, 0 as u64" isl);
+	let l_cond = fresh_label ctx "MAPC" in
+	let l_body = fresh_label ctx "MAPB" in
+	let l_found = fresh_label ctx "MAPF" in
+	let l_next = fresh_label ctx "MAPN" in
+	let l_miss = fresh_label ctx "MAPM" in
+	emit ctx (Printf.sprintf "jmp %s" l_cond);
+	emit_label ctx l_cond;
+	let i = fresh ctx "t" in
+	emit ctx (Printf.sprintf "%s = load %s+0 as u64" i isl);
+	let more = fresh ctx "t" in
+	emit ctx (Printf.sprintf "%s = ult %s, %s" more i len);
+	track ctx more;
+	emit ctx (Printf.sprintf "br %s -> %s, %s" more l_body l_miss);
+	emit_label ctx l_body;
+	let off = fresh ctx "t" in
+	emit ctx (Printf.sprintf "%s = mul %s, 16" off i);
+	track ctx off;
+	let ep = fresh ctx "t" in
+	emit ctx (Printf.sprintf "%s = ptr_add %s, %s" ep kptr off);
+	track ctx ep;
+	let lp = fresh ctx "t" in
+	emit ctx (Printf.sprintf "%s = load %s+0 as ptr" lp ep);
+	track ctx lp;
+	let ll = fresh ctx "t" in
+	emit ctx (Printf.sprintf "%s = load %s+8 as u64" ll ep);
+	track ctx ll;
+	let eqr = fresh ctx "t" in
+	emit ctx (Printf.sprintf "EXPAND STRING_EQ %s, %s, %s, %s, %s" eqr kp kl lp ll);
+	track ctx eqr;
+	emit ctx (Printf.sprintf "br %s -> %s, %s" eqr l_found l_next);
+	emit_label ctx l_found;
+	release_now ctx i;
+	let clean () =
+		release_now ctx more;
+		release_now ctx off;
+		release_now ctx ep;
+		release_now ctx lp;
+		release_now ctx ll;
+		release_now ctx eqr in
+	hit_body kptr vptr len isl clean;
+	emit_label ctx l_next;
+	release_now ctx more;
+	release_now ctx off;
+	release_now ctx ep;
+	release_now ctx lp;
+	release_now ctx ll;
+	release_now ctx eqr;
+	release_now ctx i;
+	let ni = fresh ctx "t" in
+	emit ctx (Printf.sprintf "%s = load %s+0 as u64" ni isl);
+	track ctx ni;
+	let ni2 = fresh ctx "t" in
+	emit ctx (Printf.sprintf "%s = add %s, 1" ni2 ni);
+	track ctx ni2;
+	emit ctx (Printf.sprintf "store %s+0, %s as u64" isl ni2);
+	release_now ctx ni;
+	release_now ctx ni2;
+	emit ctx (Printf.sprintf "jmp %s" l_cond);
+	emit_label ctx l_miss;
+	release_now ctx i;
+	release_now ctx more;
+	(kptr, vptr, len, isl, l_miss)
+
+(** `set`: hit overwrites the value pair; miss grows (doubling) and
+	appends. Void (statement-oriented like saveContent). *)
+and map_set_op ctx map kp kl vp vl vty =
+	let l_end = fresh_label ctx "MAPSEND" in
+	map_scan_emit ctx map kp kl (fun kptr vptr len isl clean ->
+		clean ();
+		let ii = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = load %s+0 as u64" ii isl);
+		track ctx ii;
+		let voff = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = mul %s, 16" voff ii);
+		track ctx voff;
+		let vep = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = ptr_add %s, %s" vep vptr voff);
+		track ctx vep;
+		emit ctx (Printf.sprintf "store %s+0, %s as %s" vep vp vty);
+		emit ctx (Printf.sprintf "store %s+8, %s as u64" vep vl);
+		release_now ctx kptr;
+		release_now ctx vptr;
+		release_now ctx len;
+		release_now ctx ii;
+		release_now ctx voff;
+		release_now ctx vep;
+		emit ctx (Printf.sprintf "jmp %s" l_end)
+	) |> fun (kptr, vptr, len, isl, l_miss) ->
+	let cap = fresh ctx "t" in
+	emit ctx (Printf.sprintf "%s = load %s+24 as u64" cap map);
+	track ctx cap;
+	let full = fresh ctx "t" in
+	emit ctx (Printf.sprintf "%s = eq %s, %s" full len cap);
+	track ctx full;
+	let l_grow = fresh_label ctx "MAPG" in
+	let l_app = fresh_label ctx "MAPA" in
+	let snap_g = save_live ctx in
+	emit ctx (Printf.sprintf "br %s -> %s, %s" full l_grow l_app);
+	emit_label ctx l_grow;
+	restore_live ctx snap_g;
+	let ncap = fresh ctx "t" in
+	emit ctx (Printf.sprintf "%s = mul %s, 2" ncap cap);
+	track ctx ncap;
+	let nksz = fresh ctx "t" in
+	emit ctx (Printf.sprintf "%s = mul %s, 16" nksz ncap);
+	track ctx nksz;
+	let nk = fresh ctx "t" in
+	emit ctx (Printf.sprintf "%s = alloc %s" nk nksz);
+	track ctx nk;
+	let nv = fresh ctx "t" in
+	emit ctx (Printf.sprintf "%s = alloc %s" nv nksz);
+	track ctx nv;
+	let tot = fresh ctx "t" in
+	emit ctx (Printf.sprintf "%s = mul %s, 16" tot len);
+	track ctx tot;
+	emit ctx (Printf.sprintf "call @sa_mem_copy(&%s, &%s, %s)" nk kptr tot);
+	emit ctx (Printf.sprintf "call @sa_mem_copy(&%s, &%s, %s)" nv vptr tot);
+	release_now ctx kptr;
+	release_now ctx vptr;
+	release_now ctx tot;
+	emit ctx (Printf.sprintf "store %s+0, %s as ptr" map nk);
+	emit ctx (Printf.sprintf "store %s+8, %s as ptr" map nv);
+	emit ctx (Printf.sprintf "store %s+24, %s as u64" map ncap);
+	let goff = fresh ctx "t" in
+	emit ctx (Printf.sprintf "%s = mul %s, 16" goff len);
+	track ctx goff;
+	let gep = fresh ctx "t" in
+	emit ctx (Printf.sprintf "%s = ptr_add %s, %s" gep nk goff);
+	track ctx gep;
+	emit ctx (Printf.sprintf "store %s+0, %s as ptr" gep kp);
+	emit ctx (Printf.sprintf "store %s+8, %s as u64" gep kl);
+	let gvep = fresh ctx "t" in
+	emit ctx (Printf.sprintf "%s = ptr_add %s, %s" gvep nv goff);
+	track ctx gvep;
+	emit ctx (Printf.sprintf "store %s+0, %s as %s" gvep vp vty);
+	emit ctx (Printf.sprintf "store %s+8, %s as u64" gvep vl);
+	let nlen = fresh ctx "t" in
+	emit ctx (Printf.sprintf "%s = add %s, 1" nlen len);
+	track ctx nlen;
+	emit ctx (Printf.sprintf "store %s+16, %s as u64" map nlen);
+	release_now ctx cap;
+	release_now ctx full;
+	release_now ctx ncap;
+	release_now ctx nksz;
+	release_now ctx nk;
+	release_now ctx nv;
+	release_now ctx goff;
+	release_now ctx gep;
+	release_now ctx gvep;
+	release_now ctx nlen;
+	release_now ctx len;
+	emit ctx (Printf.sprintf "jmp %s" l_end);
+	emit_label ctx l_app;
+	restore_live ctx snap_g;
+	let off = fresh ctx "t" in
+	emit ctx (Printf.sprintf "%s = mul %s, 16" off len);
+	track ctx off;
+	let ep = fresh ctx "t" in
+	emit ctx (Printf.sprintf "%s = ptr_add %s, %s" ep kptr off);
+	track ctx ep;
+	emit ctx (Printf.sprintf "store %s+0, %s as ptr" ep kp);
+	emit ctx (Printf.sprintf "store %s+8, %s as u64" ep kl);
+	let vep = fresh ctx "t" in
+	emit ctx (Printf.sprintf "%s = ptr_add %s, %s" vep vptr off);
+	track ctx vep;
+	emit ctx (Printf.sprintf "store %s+0, %s as %s" vep vp vty);
+	emit ctx (Printf.sprintf "store %s+8, %s as u64" vep vl);
+	let nlen = fresh ctx "t" in
+	emit ctx (Printf.sprintf "%s = add %s, 1" nlen len);
+	track ctx nlen;
+	emit ctx (Printf.sprintf "store %s+16, %s as u64" map nlen);
+	release_now ctx cap;
+	release_now ctx full;
+	release_now ctx kptr;
+	release_now ctx vptr;
+	release_now ctx len;
+	release_now ctx off;
+	release_now ctx ep;
+	release_now ctx vep;
+	release_now ctx nlen;
+	emit ctx (Printf.sprintf "jmp %s" l_end);
+	emit_label ctx l_end
+
+(** `get` as a value pair (for materialize): hit loads both words,
+	miss yields `(0, Imm 0)`. *)
+and map_get_pair ctx map kp kl vty =
+	let rv0 = fresh ctx "t" in
+	track ctx rv0;
+	let rv1 = fresh ctx "t" in
+	track ctx rv1;
+	let l_end = fresh_label ctx "MAPGEND" in
+	map_scan_emit ctx map kp kl (fun kptr vptr len isl clean ->
+		clean ();
+		let ii = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = load %s+0 as u64" ii isl);
+		track ctx ii;
+		let voff = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = mul %s, 16" voff ii);
+		track ctx voff;
+		let vep = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = ptr_add %s, %s" vep vptr voff);
+		track ctx vep;
+		emit ctx (Printf.sprintf "%s = load %s+0 as %s" rv0 vep vty);
+		emit ctx (Printf.sprintf "%s = load %s+8 as u64" rv1 vep);
+		release_now ctx kptr;
+		release_now ctx vptr;
+		release_now ctx len;
+		release_now ctx ii;
+		release_now ctx voff;
+		release_now ctx vep;
+		emit ctx (Printf.sprintf "jmp %s" l_end)
+	) |> fun (kptr, vptr, len, isl, l_miss) ->
+	emit ctx (Printf.sprintf "%s = add 0, 0" rv0);
+	emit ctx (Printf.sprintf "%s = add 0, 0" rv1);
+	release_now ctx kptr;
+	release_now ctx vptr;
+	release_now ctx len;
+	emit ctx (Printf.sprintf "jmp %s" l_end);
+	emit_label ctx l_end;
+	(rv0, Reg rv1)
+
+(** `exists` as 1/0. *)
+and map_exists_op ctx map kp kl =
+	let l_end = fresh_label ctx "MAPEEND" in
+	let res = fresh ctx "t" in
+	track ctx res;
+	map_scan_emit ctx map kp kl (fun kptr vptr len isl clean ->
+		clean ();
+		emit ctx (Printf.sprintf "%s = add 1, 0" res);
+		release_now ctx kptr;
+		release_now ctx vptr;
+		release_now ctx len;
+		emit ctx (Printf.sprintf "jmp %s" l_end)
+	) |> fun (kptr, vptr, len, isl, l_miss) ->
+	emit ctx (Printf.sprintf "%s = add 0, 0" res);
+	release_now ctx kptr;
+	release_now ctx vptr;
+	release_now ctx len;
+	emit ctx (Printf.sprintf "jmp %s" l_end);
+	emit_label ctx l_end;
+	Reg res
+
+(** `remove`: shift tail pairs left, decrement len. Returns 1/0. *)
+and map_remove_op ctx map kp kl =
+	let l_end = fresh_label ctx "MAPREND" in
+	let res = fresh ctx "t" in
+	track ctx res;
+	map_scan_emit ctx map kp kl (fun kptr vptr len isl clean ->
+		clean ();
+		emit ctx (Printf.sprintf "%s = add 1, 0" res);
+		let j = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = load %s+0 as u64" j isl);
+		track ctx j;
+		let lj = fresh_label ctx "MAPRJ" in
+		let lb = fresh_label ctx "MAPRB" in
+		let le = fresh_label ctx "MAPRE" in
+		emit ctx (Printf.sprintf "jmp %s" lj);
+		emit_label ctx lj;
+		let nl = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = load %s+16 as u64" nl map);
+		track ctx nl;
+		let more = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = ult %s, %s" more j nl);
+		track ctx more;
+		emit ctx (Printf.sprintf "br %s -> %s, %s" more lb le);
+		emit_label ctx lb;
+		let o1 = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = mul %s, 16" o1 j);
+		track ctx o1;
+		let s1 = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = ptr_add %s, %s" s1 kptr o1);
+		track ctx s1;
+		let o2 = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = add %s, 16" o2 o1);
+		track ctx o2;
+		let s2 = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = ptr_add %s, %s" s2 kptr o2);
+		track ctx s2;
+		let w1 = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = load %s+0 as ptr" w1 s2);
+		track ctx w1;
+		let w2 = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = load %s+8 as u64" w2 s2);
+		track ctx w2;
+		emit ctx (Printf.sprintf "store %s+0, %s as ptr" s1 w1);
+		emit ctx (Printf.sprintf "store %s+8, %s as u64" s1 w2);
+		let v1 = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = ptr_add %s, %s" v1 vptr o1);
+		track ctx v1;
+		let v2 = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = ptr_add %s, %s" v2 vptr o2);
+		track ctx v2;
+		let u1 = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = load %s+0 as ptr" u1 v2);
+		track ctx u1;
+		let u2 = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = load %s+8 as u64" u2 v2);
+		track ctx u2;
+		emit ctx (Printf.sprintf "store %s+0, %s as ptr" v1 u1);
+		emit ctx (Printf.sprintf "store %s+8, %s as u64" v1 u2);
+		release_now ctx o1;
+		release_now ctx s1;
+		release_now ctx o2;
+		release_now ctx s2;
+		release_now ctx w1;
+		release_now ctx w2;
+		release_now ctx v1;
+		release_now ctx v2;
+		release_now ctx u1;
+		release_now ctx u2;
+		release_now ctx nl;
+		release_now ctx more;
+		let j2 = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = add %s, 1" j2 j);
+		track ctx j2;
+		emit ctx (Printf.sprintf "store %s+0, %s as u64" isl j2);
+		release_now ctx j2;
+		release_now ctx j;
+		emit ctx (Printf.sprintf "jmp %s" lj);
+		emit_label ctx le;
+		release_now ctx j;
+		release_now ctx nl;
+		release_now ctx more;
+		let nl2 = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = load %s+16 as u64" nl2 map);
+		track ctx nl2;
+		let nl3 = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = sub %s, 1" nl3 nl2);
+		track ctx nl3;
+		emit ctx (Printf.sprintf "store %s+16, %s as u64" map nl3);
+		release_now ctx nl2;
+		release_now ctx nl3;
+		release_now ctx kptr;
+		release_now ctx vptr;
+		release_now ctx len;
+		emit ctx (Printf.sprintf "jmp %s" l_end)
+	) |> fun (kptr, vptr, len, isl, l_miss) ->
+	emit ctx (Printf.sprintf "%s = add 0, 0" res);
+	release_now ctx kptr;
+	release_now ctx vptr;
+	release_now ctx len;
+	emit ctx (Printf.sprintf "jmp %s" l_end);
+	emit_label ctx l_end;
+	Reg res
+
+(** v0.26 `haxe.ds.StringMap` lowered directly to heap structure
+	(zero new ABI, no Haxe bodies needed — the class is bare-generic).
+	Layout: header `[kptr+0][vptr+8][len+16][cap+24]`; keys and values
+	are 16-byte pairs. Linear scan with `STRING_EQ`; growth by
+	doubling. `get` on missing keys yields `(0, 0)` (documented
+	zero-value convention; use `exists` for presence). Loop index
+	lives in a stack slot (never a redefined reg). *)
+(** Value pair for map stores: strings materialize (ptr + len),
+	other scalars pass by value with zero length word. *)
+and map_val_pair ctx v =
+	if is_string_t v.etype then
+		match materialize_owned ctx v with
+		| Some (p, lop) -> Some (p, ops lop)
+		| None -> None
+	else
+		Some ((match gen_operand ctx v with Imm s -> s | Reg r -> r), "0")
+
+(** StringMap method dispatch (set/get/exists/remove). `use_ty` is the
+	call-site result type (drives value annotation). *)
+and map_method_op ctx obj cf args use_ty =
+	match gen_operand ctx obj with
+	| Imm _ ->
+		comment ctx "SA-TODO(v0.26): map base must be a register";
+		Imm "0"
+	| Reg m ->
+	match cf.cf_name, args with
+	| "set", [k; v] ->
+		(match materialize_owned ctx k, map_val_pair ctx v with
+		| Some (kp, klop), Some (vp, vlop) ->
+			map_set_op ctx m kp (ops klop) vp vlop (map_val_ty v.etype);
+			Imm "0"
+		| _ ->
+			comment ctx "SA-TODO(v0.26): map set needs resolvable key/value";
+			Imm "0")
+	| "get", [k] ->
+		(match materialize_owned ctx k with
+		| Some (kp, klop) ->
+			let vty = map_val_ty use_ty in
+			if vty = "ptr" && not (is_string_t use_ty) then begin
+				comment ctx "SA-TODO(v0.26): map get of aggregate value";
+				Imm "0"
+			end else begin
+				let (v0, _) = map_get_pair ctx m kp (ops klop) vty in
+				Reg v0
+			end
+		| None ->
+			comment ctx "SA-TODO(v0.26): map get needs resolvable key";
+			Imm "0")
+	| "exists", [k] ->
+		(match materialize_owned ctx k with
+		| Some (kp, klop) -> map_exists_op ctx m kp (ops klop)
+		| None ->
+			comment ctx "SA-TODO(v0.26): map exists needs resolvable key";
+			Imm "0")
+	| "remove", [k] ->
+		(match materialize_owned ctx k with
+		| Some (kp, klop) -> map_remove_op ctx m kp (ops klop)
+		| None ->
+			comment ctx "SA-TODO(v0.26): map remove needs resolvable key";
+			Imm "0")
+	| _ ->
+		comment ctx ("SA-TODO(v0.26): Map." ^ cf.cf_name);
+		Imm "0"
+
 and gen_call ctx c cf args =
 	let name = sa_fun_name c cf in
 	if not (Hashtbl.mem ctx.emitted name) then begin
@@ -3119,6 +3606,8 @@ let generate com =
 		output_string ch "@import \"sa_std/fmt.sai\"\n";
 	if buf_has body "sa_time_" || buf_has funcs "sa_time_" then
 		output_string ch "@import \"sa_std/time.sai\"\n";
+	if buf_has body "sa_mem_copy" || buf_has funcs "sa_mem_copy" then
+		output_string ch "@import \"sa_std/core/mem.sa\"\n";
 	if buf_has body "sa_math_" || buf_has funcs "sa_math_" then
 		output_string ch "@import \"sa_std/math.sai\"\n";
 	if buf_has body "NET_TCP_" || buf_has funcs "NET_TCP_"

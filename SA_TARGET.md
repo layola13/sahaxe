@@ -210,4 +210,7 @@ struct 20%, array 10%)。按用户指令：基础特性优先，其次 hxml，�
 - v0.25: `Date` (extern 无 body，正好特判：`now()` 堆对象 +
   `getTime`/getters 经 `sa_time_*`)；fixture DateHx；
   27 fixture 全绿。
+- v0.26: `Map<String,_>` 直降 (16B pair 并行数组 + `STRING_EQ`
+  线性扫描 + 翻倍增长；零值缺失约定；`!` 逻辑非经 `eq 0`)；
+  fixture MapHx；28 fixture 全绿。
 - 每个版本独立提交并推送，`sa_std` 缺失先补 `sci/sa_std`。
