@@ -128,8 +128,9 @@ struct 20%, array 10%)。按用户指令：基础特性优先，其次 hxml，�
   声明/使用一致；类实例需构造调用，留 v0.5)；字符串值操作数
   (`&CONST` 直存)；数组元素内字段写保护性回退；
   fixtures Obj/ObjArr 零 TODO (堆对象经数组存活得到覆盖)。
-- v0.5: `switch` → `eq` 链、enum、type alias、函数调用
-  (borrow/move 前缀)，fs/net (`fs.sai`/`net.sai`)。
+- v0.5a (本提交): `switch` → `eq`+`br` 链 (多模式或链，default，
+  对称释放，终结传播)；无参 enum 构造 = tag 常量，`TEnumIndex`
+  透传；字符串/guard/payload 模式诚实回退；fixture Switch 零 TODO。
 - v0.6: class、泛型单态化、异常 `panic` → `T!`/`?`。
 - v0.7: hxml 工程支持 (`--sa` 与现有 `--next/--each` 批处理互通)。
 - v0.8: 宏 (`--macro`) 在 SA 目标下的求值与展开。

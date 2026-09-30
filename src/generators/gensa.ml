@@ -137,6 +137,21 @@ let intern_string ctx s =
 		(Printf.sprintf "@const %s = utf8:\"%s\"\n" name (sa_escape s));
 	(name, String.length s)
 
+let expr_kind e =
+	match e.eexpr with
+	| TConst _ -> "TConst" | TLocal _ -> "TLocal" | TArray _ -> "TArray"
+	| TBinop (op, _, _) -> "TBinop:" ^ Ast.s_binop op
+	| TField _ -> "TField" | TTypeExpr _ -> "TTypeExpr"
+	| TParenthesis _ -> "TParenthesis" | TObjectDecl _ -> "TObjectDecl"
+	| TArrayDecl _ -> "TArrayDecl" | TCall _ -> "TCall" | TNew _ -> "TNew"
+	| TUnop _ -> "TUnop" | TFunction _ -> "TFunction" | TVar _ -> "TVar"
+	| TBlock _ -> "TBlock" | TIf _ -> "TIf"
+	| TWhile _ -> "TWhile" | TSwitch _ -> "TSwitch" | TTry _ -> "TTry"
+	| TReturn _ -> "TReturn" | TBreak -> "TBreak" | TContinue -> "TContinue"
+	| TThrow _ -> "TThrow" | TCast _ -> "TCast" | TMeta _ -> "TMeta"
+	| TEnumParameter _ -> "TEnumParameter" | TEnumIndex _ -> "TEnumIndex"
+	| TIdent _ -> "TIdent"
+
 let rec gen_operand ctx e =
 	match e.eexpr with
 	| TConst (TInt i) -> Imm (Int32.to_string i)
@@ -149,6 +164,10 @@ let rec gen_operand ctx e =
 			buffer (v0.5). Direct literal trace avoids this path. *)
 		let (name, _) = intern_string ctx s in
 		Imm ("&" ^ name)
+	| TField (_, FEnum (_, ef)) ->
+		(* Payload-free enum constructor = its tag index. Payload
+			enums / match extraction are a v0.6 TODO (cf. sala). *)
+		Imm (string_of_int ef.ef_index)
 	| TLocal v -> begin
 		try
 			let slot = Hashtbl.find ctx.vars v.v_id in
@@ -238,12 +257,17 @@ let rec gen_operand ctx e =
 	| TBinop (op, e1, e2) -> gen_binop ctx op e1 e2 e.etype
 	| TParenthesis e1 | TMeta (_, e1) -> gen_operand ctx e1
 	| TCast (e1, _) -> gen_operand ctx e1
+	| TEnumIndex e1 ->
+		(* Tag extraction: our payload-free enum values already ARE
+			the tag (stored by FEnum arm), so lower the inner value.
+			Payload enums (TEnumParameter) stay a v0.6 TODO. *)
+		gen_operand ctx e1
 	| TArrayDecl elems -> gen_array_decl ctx elems
 	| TArray (base, idx) -> gen_array_get ctx base idx
 	| TField (base, acc) when is_length_access base acc ->
 		gen_array_len ctx base
 	| _ ->
-		comment ctx "SA-TODO(v0.2/v0.3): unsupported expression";
+		comment ctx ("SA-TODO(v0.2/v0.3): unsupported expression " ^ expr_kind e);
 		Imm "0"
 
 (** Array layout v0.4a (fixed-size, 8-byte slots):
@@ -485,20 +509,6 @@ let gen_trace ctx args =
 	| _ ->
 		comment ctx "SA-TODO(v0.2): trace of non-literal (needs fmt buffer)"
 
-let expr_kind e =
-	match e.eexpr with
-	| TConst _ -> "TConst" | TLocal _ -> "TLocal" | TArray _ -> "TArray"
-	| TBinop (op, _, _) -> "TBinop:" ^ Ast.s_binop op
-	| TField _ -> "TField" | TTypeExpr _ -> "TTypeExpr"
-	| TParenthesis _ -> "TParenthesis" | TObjectDecl _ -> "TObjectDecl"
-	| TArrayDecl _ -> "TArrayDecl" | TCall _ -> "TCall" | TNew _ -> "TNew"
-	| TUnop _ -> "TUnop" | TFunction _ -> "TFunction" | TVar _ -> "TVar"
-	| TBlock _ -> "TBlock" | TIf _ -> "TIf"
-	| TWhile _ -> "TWhile" | TSwitch _ -> "TSwitch" | TTry _ -> "TTry"
-	| TReturn _ -> "TReturn" | TBreak -> "TBreak" | TContinue -> "TContinue"
-	| TThrow _ -> "TThrow" | TCast _ -> "TCast" | TMeta _ -> "TMeta"
-	| TEnumParameter _ -> "TEnumParameter" | TEnumIndex _ -> "TEnumIndex"
-	| TIdent _ -> "TIdent"
 
 let release_all_except ctx keep =
 	List.iter (fun r ->
@@ -537,7 +547,12 @@ let rec collect_vars acc e =
 		let acc = collect_vars acc t in
 		(match eo with Some x -> collect_vars acc x | None -> acc)
 	| TWhile (c, b, _) -> collect_vars (collect_vars acc c) b
-	| TSwitch _ -> acc
+	| TSwitch sw ->
+		let acc = collect_vars acc sw.switch_subject in
+		let acc = List.fold_left (fun a c ->
+			let a = List.fold_left collect_vars a c.case_patterns in
+			collect_vars a c.case_expr) acc sw.switch_cases in
+		(match sw.switch_default with Some x -> collect_vars acc x | None -> acc)
 	| TParenthesis e1 | TMeta (_, e1) | TCast (e1, _) -> collect_vars acc e1
 	| _ -> acc
 
@@ -568,7 +583,101 @@ let rec has_direct_jump depth e =
 	| TParenthesis e1 | TMeta (_, e1) | TCast (e1, _) -> has_direct_jump depth e1
 	| _ -> false
 
-let rec gen_stmt ctx e =
+(** Integer-like switch pattern (int/bool/enum-tag constants).
+	String patterns need content equality (v0.6); anything else is
+	exotic (guards, payloads) and rejects the whole switch honestly. *)
+and switch_pat_const e =
+	match e.eexpr with
+	| TConst (TInt i) -> Some (Int32.to_string i)
+	| TConst (TBool b) -> Some (if b then "1" else "0")
+	| TField (_, FEnum (_, ef)) -> Some (string_of_int ef.ef_index)
+	| TParenthesis e1 | TMeta (_, e1) | TCast (e1, _) -> switch_pat_const e1
+	| _ -> None
+
+(** `switch` -> `eq` + `br` chains (see sala 06_limitations: no
+	structured switch in SA). Subject evaluated once; arm temps
+	released symmetrically like `if` arms. *)
+and gen_switch ctx sw =
+	let all_pats = List.concat (List.map (fun c -> c.case_patterns) sw.switch_cases) in
+	if List.exists (fun p -> switch_pat_const p = None) all_pats then begin
+		comment ctx "SA-TODO(v0.6): exotic switch patterns (string/guard/payload)";
+		false
+	end else begin
+		let so = gen_operand ctx sw.switch_subject in
+		let ss = match so with Imm s -> s | Reg r -> r in
+		let l_end = fresh_label ctx "ENDSWITCH" in
+		let l_def = match sw.switch_default with
+			| Some _ -> Some (fresh_label ctx "SWDEF")
+			| None -> None in
+		let tag = ctx.next_label in
+		ctx.next_label <- ctx.next_label + 1;
+		let arms = List.mapi (fun i c ->
+			(Printf.sprintf "L_ARM%d_%d" tag i, c)) sw.switch_cases in
+		let rec emit_tests = function
+			| [] -> ()
+			| (arm_label, c) :: rest ->
+				let ft = match rest, l_def with
+					| [], None -> l_end
+					| [], Some d -> d
+					| _ -> fresh_label ctx "SWNEXT" in
+				if c.case_patterns = [] then
+					emit ctx (Printf.sprintf "jmp %s" arm_label)
+				else begin
+				let rec one_pat = function
+					| [] -> ()
+					| [p] ->
+						let ps = match switch_pat_const p with
+							| Some s -> s | None -> "0" in
+						let t = fresh ctx "t" in
+						emit ctx (Printf.sprintf "%s = eq %s, %s" t ss ps);
+						track ctx t;
+						emit ctx (Printf.sprintf "br %s -> %s, %s" t arm_label ft);
+						let is_fall = match l_def with
+							| Some d -> ft <> l_end && ft <> d
+							| None -> ft <> l_end in
+						if is_fall then emit_label ctx ft
+					| p :: ps ->
+						let pcs = match switch_pat_const p with
+							| Some s -> s | None -> "0" in
+						let t = fresh ctx "t" in
+						emit ctx (Printf.sprintf "%s = eq %s, %s" t ss pcs);
+						track ctx t;
+						let l_or = fresh_label ctx "SWOR" in
+						emit ctx (Printf.sprintf "br %s -> %s, %s" t arm_label l_or);
+						emit_label ctx l_or;
+						one_pat ps
+				in
+				one_pat c.case_patterns;
+				emit_tests rest
+				end
+		in
+		emit_tests arms;
+		let all_term = ref true in
+		List.iter (fun (arm_label, c) ->
+			emit_label ctx arm_label;
+			let snap = snapshot ctx in
+			let term = gen_stmt ctx c.case_expr in
+			release_since ctx snap;
+			if not term then emit ctx (Printf.sprintf "jmp %s" l_end);
+			all_term := !all_term && term
+		) arms;
+		(match sw.switch_default, l_def with
+		| Some d, Some ld ->
+			emit_label ctx ld;
+			let snap = snapshot ctx in
+			let term = gen_stmt ctx d in
+			release_since ctx snap;
+			if not term then emit ctx (Printf.sprintf "jmp %s" l_end);
+			all_term := !all_term && term
+		| _ -> ());
+		emit_label ctx l_end;
+		!all_term
+	end
+
+(* Joins the gen_operand/gen_switch `rec` chain above: switch arms,
+	if branches and loop bodies lower statements, statements contain
+	expressions and nested control flow. *)
+and gen_stmt ctx e =
 	match e.eexpr with
 	| TBlock el ->
 		let term = ref false in
@@ -694,9 +803,8 @@ let rec gen_stmt ctx e =
 			true
 		| [] -> comment ctx "SA-TODO: continue outside loop"; false
 	end
-	| TSwitch _ ->
-		comment ctx "SA-TODO(v0.5): switch (eq chain)";
-		false
+	| TSwitch sw ->
+		gen_switch ctx sw
 	| TParenthesis e1 | TMeta (_, e1) -> gen_stmt ctx e1
 	| TConst _ | TLocal _ | TBinop _ | TUnop _ | TArray _ | TArrayDecl _
 	| TField _ | TObjectDecl _ ->
