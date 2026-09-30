@@ -870,6 +870,7 @@ let rec gen_operand ctx e =
 		| ("lastIndexOf", [ndl; from]) -> (match str_index_of_op ctx obj ndl (Some from) true with
 			| Some o -> o
 			| None -> comment ctx "SA-TODO(v0.28): lastIndexOf"; Imm "0")
+		| ("split", [delim]) -> str_split_op ctx obj delim
 		| _ ->
 			comment ctx ("SA-TODO(v0.28): String." ^ cf.cf_name);
 			Imm "0")
@@ -1304,18 +1305,40 @@ and elem_ty base =
 	| TInst ({ cl_path = ([], "Array") }, [t]) -> mem_ty t
 	| _ -> "i32"
 
+(** Element stride: 16-byte pairs for String elements, 8 otherwise.
+	Layout is always `[len:u64][elems...]` so element i lives at
+	`8 + i*stride` (v0.4a missed the +8 header offset — fixed here). *)
+and elem_stride base =
+	match follow base.etype with
+	| TInst ({ cl_path = ([], "Array") }, [t]) ->
+		if is_string_t t then 16 else 8
+	| _ -> 8
+
 and gen_array_decl ctx elems =
 	let n = List.length elems in
+	let is_str_arr = n > 0 && List.for_all (fun ee -> is_string_t ee.etype) elems in
+	let stride = if is_str_arr then 16 else 8 in
 	let arr = fresh ctx "arr" in
-	emit ctx (Printf.sprintf "%s = alloc %d" arr ((n + 1) * 8));
+	emit ctx (Printf.sprintf "%s = alloc %d" arr (n * stride + 8));
 	track ctx arr;
 	emit ctx (Printf.sprintf "store %s+0, %d as u64" arr n);
-	List.iteri (fun i ee ->
-		let o = gen_operand ctx ee in
-		let os = match o with Imm s -> s | Reg r -> r in
-		let ty = mem_ty ee.etype in
-		emit ctx (Printf.sprintf "store %s+%d, %s as %s" arr ((i + 1) * 8) os ty)
-	) elems;
+	if is_str_arr then
+		List.iteri (fun i ee ->
+			match materialize_owned ctx ee with
+			| Some (rp, lop) ->
+				emit ctx (Printf.sprintf "store %s+%d, %s as ptr" arr (8 + i * 16) rp);
+				emit ctx (Printf.sprintf "store %s+%d, %s as u64" arr (16 + i * 16)
+					(match lop with Imm s -> s | Reg r -> r))
+			| None ->
+				comment ctx "SA-TODO(v0.29): string array literal needs materializable element"
+		) elems
+	else
+		List.iteri (fun i ee ->
+			let o = gen_operand ctx ee in
+			let os = match o with Imm s -> s | Reg r -> r in
+			let ty = mem_ty ee.etype in
+			emit ctx (Printf.sprintf "store %s+%d, %s as %s" arr ((i + 1) * 8) os ty)
+		) elems;
 	Reg arr
 
 and gen_array_ptr ctx base idx =
@@ -1327,9 +1350,14 @@ and gen_array_ptr ctx base idx =
 		None
 	| Reg b ->
 		let si = match oi with Imm s -> s | Reg r -> r in
+		let esz = elem_stride base in
+		let eb = fresh ctx "off" in
+		emit ctx (Printf.sprintf "%s = mul %s, %d" eb si esz);
+		track ctx eb;
 		let off = fresh ctx "off" in
-		emit ctx (Printf.sprintf "%s = mul %s, 8" off si);
+		emit ctx (Printf.sprintf "%s = add %s, 8" off eb);
 		track ctx off;
+		release_now ctx eb;
 		let p = fresh ctx "ep" in
 		emit ctx (Printf.sprintf "%s = ptr_add %s, %s" p b off);
 		track ctx p;
@@ -1339,19 +1367,36 @@ and gen_array_get ctx base idx =
 	match gen_array_ptr ctx base idx with
 	| None -> Imm "0"
 	| Some p ->
-		let r = fresh ctx "t" in
-		emit ctx (Printf.sprintf "%s = load %s+0 as %s" r p (elem_ty base));
-		track ctx r;
-		Reg r
+		if elem_stride base = 16 then begin
+			comment ctx "SA-TODO(v0.29): string array read needs pair context (store first)";
+			Imm "0"
+		end else begin
+			let r = fresh ctx "t" in
+			emit ctx (Printf.sprintf "%s = load %s+0 as %s" r p (elem_ty base));
+			track ctx r;
+			Reg r
+		end
 
 and gen_array_set ctx base idx rhs =
 	match gen_array_ptr ctx base idx with
 	| None -> Imm "0"
 	| Some p ->
-		let o = gen_operand ctx rhs in
-		let os = match o with Imm s -> s | Reg r -> r in
-		emit ctx (Printf.sprintf "store %s+0, %s as %s" p os (elem_ty base));
-		o
+		if elem_stride base = 16 then begin
+			match materialize_owned ctx rhs with
+			| Some (rp, lop) ->
+				emit ctx (Printf.sprintf "store %s+0, %s as ptr" p rp);
+				emit ctx (Printf.sprintf "store %s+8, %s as u64" p
+					(match lop with Imm s -> s | Reg r -> r));
+				if String.length rp > 0 && rp.[0] = '&' then Imm rp else Reg rp
+			| None ->
+				comment ctx "SA-TODO(v0.29): string array store needs materializable value";
+				Imm "0"
+		end else begin
+			let o = gen_operand ctx rhs in
+			let os = match o with Imm s -> s | Reg r -> r in
+			emit ctx (Printf.sprintf "store %s+0, %s as %s" p os (elem_ty base));
+			o
+		end
 
 and is_length_access base acc =
 	(match follow base.etype with
@@ -1607,6 +1652,18 @@ and materialize_owned ctx e : (string * operand) option =
 		| _ ->
 			comment ctx "SA-TODO(v0.26): map get needs map register";
 			None)
+	| TArray (base, idx) when elem_stride base = 16 ->
+		(match gen_array_ptr ctx base idx with
+		| None -> None
+		| Some p ->
+			let r = fresh ctx "t" in
+			emit ctx (Printf.sprintf "%s = load %s+0 as ptr" r p);
+			track ctx r;
+			let l = fresh ctx "t" in
+			emit ctx (Printf.sprintf "%s = load %s+8 as u64" l p);
+			track ctx l;
+			release_now ctx p;
+			Some (r, Reg l))
 	| TCall ({ eexpr = TField (obj, FInstance (c, _, cf)) }, args)
 		when s_type_path c.cl_path = "String" ->
 		(match cf.cf_name, args with
@@ -1704,7 +1761,6 @@ and materialize_concat_owned ctx l r =
 	else begin
 		let pairs = List.map (function Some x -> x | None -> ("", Imm "0")) resolved in
 		let opstr = function Imm s -> s | Reg rr -> rr in
-		let (p0, l0) = List.hd pairs in
 		let cur_h = ref "" in
 		let step pa la pb lb first =
 			let h = fresh ctx "h" in
@@ -3625,7 +3681,7 @@ and ereg_matched_pair ctx obj idx =
 (** v0.28 `String` methods over existing `string.sai` contracts.
 	`length` reads tracked lengths (never content words). Index/search
 	ops return plain ints; case/substr/charAt materialize owned pairs.
-	`split` stays deferred (needs 16-byte string array elements). *)
+	v0.29 adds `split` (below): two passes into a 16-byte-pair array. *)
 and str_index_of_op ctx obj ndl from is_last =
 	match string_operands ctx obj with
 	| Some (hp, hl) ->
@@ -3697,8 +3753,9 @@ and str_substr_op ctx obj pos len =
 		release_now ctx rem;
 		emit ctx (Printf.sprintf "jmp %s" l_end);
 		emit_label ctx l_end;
+		let ppr = addr_reg_of ctx pp in
 		let src = fresh ctx "t" in
-		emit ctx (Printf.sprintf "%s = ptr_add %s, %s" src pp ps);
+		emit ctx (Printf.sprintf "%s = ptr_add %s, %s" src ppr ps);
 		track ctx src;
 		let own = fresh ctx "t" in
 		emit ctx (Printf.sprintf "%s = alloc %s" own llen);
@@ -3724,6 +3781,195 @@ and str_char_at_op ctx obj idx =
 		Some (owned_of_handle ctx h
 			"sa_fmt_buffer_data" "sa_fmt_buffer_len" "sa_fmt_buffer_free")
 	| None -> None
+
+(** v0.29 `split(delim)`: two passes (count, fill) into a 16-byte-pair
+	string array. Empty delimiters panic loudly. Loop-carried state in
+	stack slots; every temp released exactly once per path. *)
+
+(** Address operand to register: a literal (`&CONST`) feeds calls and
+	stores fine but traps `UnknownRegister` under arithmetic (`ptr_add`).
+	Spill through the entry scratch slot; registers pass through. *)
+and addr_reg_of ctx pp =
+	if String.length pp > 0 && pp.[0] = '&' then begin
+		let ss = ensure_pslot ctx in
+		emit ctx (Printf.sprintf "store %s+0, %s as ptr" ss pp);
+		let r = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = load %s+0 as ptr" r ss);
+		track ctx r;
+		r
+	end else pp
+
+and str_split_op ctx obj delim =
+	match string_operands ctx obj, string_operands ctx delim with
+	| Some (pp, pl), Some (dp, dl) ->
+		let ppr = addr_reg_of ctx pp in
+		let e0 = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = eq %s, 0" e0 dl);
+		track ctx e0;
+		let l_bad = fresh_label ctx "SPBAD" in
+		let l_ok = fresh_label ctx "SPOK" in
+		emit ctx (Printf.sprintf "br %s -> %s, %s" e0 l_bad l_ok);
+		emit_label ctx l_bad;
+		emit ctx "panic(\"haxe:split-empty\")";
+		emit_label ctx l_ok;
+		release_now ctx e0;
+		let nslot = fresh ctx "var" in
+		emit ctx (Printf.sprintf "%s = stack_alloc 8" nslot);
+		emit ctx (Printf.sprintf "store %s+0, 1 as u64" nslot);
+		let pslot = fresh ctx "var" in
+		emit ctx (Printf.sprintf "%s = stack_alloc 8" pslot);
+		emit ctx (Printf.sprintf "store %s+0, 0 as u64" pslot);
+		let cslot = fresh ctx "var" in
+		emit ctx (Printf.sprintf "%s = stack_alloc 8" cslot);
+		emit ctx (Printf.sprintf "store %s+0, 0 as u64" cslot);
+		let l1 = fresh_label ctx "SPC1" in
+		let l1b = fresh_label ctx "SPB1" in
+		let l1n = fresh_label ctx "SPN1" in
+		let l1e = fresh_label ctx "SPE1" in
+		emit ctx (Printf.sprintf "jmp %s" l1);
+		emit_label ctx l1;
+		let pos = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = load %s+0 as u64" pos pslot);
+		track ctx pos;
+		let idx = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = call @sa_string_index_of(%s, %s, %s, %s, %s)"
+			idx pp pl dp dl pos);
+		track ctx idx;
+		let found = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = ult %s, %s" found idx pl);
+		track ctx found;
+		release_now ctx pos;
+		emit ctx (Printf.sprintf "br %s -> %s, %s" found l1b l1n);
+		emit_label ctx l1b;
+		let nn = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = load %s+0 as u64" nn nslot);
+		track ctx nn;
+		let nn2 = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = add %s, 1" nn2 nn);
+		track ctx nn2;
+		emit ctx (Printf.sprintf "store %s+0, %s as u64" nslot nn2);
+		let np = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = add %s, %s" np idx dl);
+		track ctx np;
+		emit ctx (Printf.sprintf "store %s+0, %s as u64" pslot np);
+		release_now ctx nn;
+		release_now ctx nn2;
+		release_now ctx np;
+		release_now ctx idx;
+		release_now ctx found;
+		emit ctx (Printf.sprintf "jmp %s" l1);
+		emit_label ctx l1n;
+		release_now ctx idx;
+		release_now ctx found;
+		emit ctx (Printf.sprintf "jmp %s" l1e);
+		emit_label ctx l1e;
+		let cnt = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = load %s+0 as u64" cnt nslot);
+		track ctx cnt;
+		let sz = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = mul %s, 16" sz cnt);
+		track ctx sz;
+		let sz8 = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = add %s, 8" sz8 sz);
+		track ctx sz8;
+		let arr = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = alloc %s" arr sz8);
+		track ctx arr;
+		emit ctx (Printf.sprintf "store %s+0, %s as u64" arr cnt);
+		release_now ctx sz;
+		release_now ctx sz8;
+		release_now ctx cnt;
+		emit ctx (Printf.sprintf "store %s+0, 0 as u64" pslot);
+		emit ctx (Printf.sprintf "store %s+0, 0 as u64" cslot);
+		let emit_piece ps2 seg =
+			let ci = fresh ctx "t" in
+			emit ctx (Printf.sprintf "%s = load %s+0 as u64" ci cslot);
+			track ctx ci;
+			let off = fresh ctx "t" in
+			emit ctx (Printf.sprintf "%s = mul %s, 16" off ci);
+			track ctx off;
+			let off8 = fresh ctx "t" in
+			emit ctx (Printf.sprintf "%s = add %s, 8" off8 off);
+			track ctx off8;
+			let ep = fresh ctx "t" in
+			emit ctx (Printf.sprintf "%s = ptr_add %s, %s" ep arr off8);
+			track ctx ep;
+			let own = fresh ctx "t" in
+			emit ctx (Printf.sprintf "%s = alloc %s" own seg);
+			track ctx own;
+			let srcp = fresh ctx "t" in
+			emit ctx (Printf.sprintf "%s = ptr_add %s, %s" srcp ppr ps2);
+			track ctx srcp;
+			emit ctx (Printf.sprintf "call @sa_mem_copy(&%s, &%s, %s)" own srcp seg);
+			emit ctx (Printf.sprintf "store %s+0, %s as ptr" ep own);
+			emit ctx (Printf.sprintf "store %s+8, %s as u64" ep seg);
+			(* The array owns the piece pointer from here; end the name
+				in-loop (exit scope cannot see branch-local defs). *)
+			release_now ctx own;
+			let ci2 = fresh ctx "t" in
+			emit ctx (Printf.sprintf "%s = add %s, 1" ci2 ci);
+			track ctx ci2;
+			emit ctx (Printf.sprintf "store %s+0, %s as u64" cslot ci2);
+			release_now ctx ci;
+			release_now ctx off;
+			release_now ctx off8;
+			release_now ctx ep;
+			release_now ctx srcp;
+			release_now ctx ci2 in
+		let l2 = fresh_label ctx "SPC2" in
+		let l2b = fresh_label ctx "SPB2" in
+		let l2n = fresh_label ctx "SPN2" in
+		let l2e = fresh_label ctx "SPEND" in
+		emit ctx (Printf.sprintf "jmp %s" l2);
+		emit_label ctx l2;
+		let pos2 = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = load %s+0 as u64" pos2 pslot);
+		track ctx pos2;
+		let idx2 = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = call @sa_string_index_of(%s, %s, %s, %s, %s)"
+			idx2 pp pl dp dl pos2);
+		track ctx idx2;
+		let found2 = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = ult %s, %s" found2 idx2 pl);
+		track ctx found2;
+		release_now ctx pos2;
+		emit ctx (Printf.sprintf "br %s -> %s, %s" found2 l2b l2n);
+		emit_label ctx l2b;
+		let ps2 = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = load %s+0 as u64" ps2 pslot);
+		track ctx ps2;
+		let seg = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = sub %s, %s" seg idx2 ps2);
+		track ctx seg;
+		emit_piece ps2 seg;
+		let np2 = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = add %s, %s" np2 idx2 dl);
+		track ctx np2;
+		emit ctx (Printf.sprintf "store %s+0, %s as u64" pslot np2);
+		release_now ctx ps2;
+		release_now ctx seg;
+		release_now ctx idx2;
+		release_now ctx found2;
+		release_now ctx np2;
+		emit ctx (Printf.sprintf "jmp %s" l2);
+		emit_label ctx l2n;
+		let ps3 = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = load %s+0 as u64" ps3 pslot);
+		track ctx ps3;
+		let seg3 = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = sub %s, %s" seg3 pl ps3);
+		track ctx seg3;
+		emit_piece ps3 seg3;
+		release_now ctx ps3;
+		release_now ctx seg3;
+		release_now ctx idx2;
+		release_now ctx found2;
+		emit ctx (Printf.sprintf "jmp %s" l2e);
+		emit_label ctx l2e;
+		Reg arr
+	| _ ->
+		comment ctx "SA-TODO(v0.29): split needs resolvable strings";
+		Imm "0"
 
 and gen_call ctx c cf args =
 	let name = sa_fun_name c cf in

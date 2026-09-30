@@ -219,4 +219,12 @@ struct 20%, array 10%)。按用户指令：基础特性优先，其次 hxml，�
 - v0.28: String 方法组 (length 读长度表；indexOf/lastIndexOf；
   substr 带钳制+负数 panic；toUpper/Lower；charAt)；
   fixture StrAdv；30 fixture 全绿。
+- v0.29: `String.split` 两遍式 (计数+填充，经既有
+  `sa_string_index_of`；空分隔符 panic；16B pair 数组；
+  命中判定用 `ult idx, len`，与 i32 符号扩展方式无关)；
+  字符串字面量数组 16B 化；`&CONST` 进算术前经 pslot 中转
+  (同修 substr 字面量 subject 潜伏 bug)；分支内创建的堆名
+  在分支内结束 (出口作用域不可见)；fixture StrSplit
+  (split/单段/空洞/尾部分隔/字面量数组/字面量 substr)；
+  31 fixture 全绿。
 - 每个版本独立提交并推送，`sa_std` 缺失先补 `sci/sa_std`。

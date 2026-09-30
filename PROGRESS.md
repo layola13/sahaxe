@@ -41,6 +41,11 @@ Haxe `--sa` 目标：将 Haxe 程序编译为 SA 文本汇编 (`.sa`)，
   留最旧，`take` 留最新，用反即双释/漏释。
 - 函数参数是存活寄存器，出口必释。
 - `&CONST` 入参的宏不得释放入参 (SLICE_NEW 惯例)。
+- `&CONST` 不得直接进算术 (`ptr_add &C, x` 报 UnknownRegister)；
+  经 entry scratch 槽 (pslot) 中转：store 后立刻 load，相邻无调用即安全。
+- 分支/循环内创建的寄存器名必须在同一作用域内 `!` 掉
+  (出口 `release_all` 看不见分支局部定义，报 UnknownRegister)；
+  `!` 只结束名字不 free 内存，堆指针存入数组后即可结束名字。
 
 ## 待办 (按优先级)
 
