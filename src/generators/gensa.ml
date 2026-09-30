@@ -1022,6 +1022,23 @@ let rec gen_operand ctx e =
 		(match gen_operand ctx lnr with
 		| Imm s -> net_bound_port_op ctx s
 		| Reg r -> net_bound_port_op ctx r)
+	| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, [host; port])
+		when s_type_path c.cl_path = "sa.net.Tcp" && cf.cf_name = "connect" ->
+		net_tcp_connect_op ctx host port
+	| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, [stream; data])
+		when s_type_path c.cl_path = "sa.net.Tcp" && cf.cf_name = "write" ->
+		net_tcp_write_op ctx stream data
+	| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, [port])
+		when s_type_path c.cl_path = "sa.net.Udp" && cf.cf_name = "bind" ->
+		net_udp_bind_op ctx port
+	| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, [s])
+		when s_type_path c.cl_path = "sa.net.Udp" && cf.cf_name = "port" ->
+		(match gen_operand ctx s with
+		| Imm x -> net_udp_port_op ctx x
+		| Reg r -> net_udp_port_op ctx r)
+	| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, [s; data])
+		when s_type_path c.cl_path = "sa.net.Udp" && cf.cf_name = "send" ->
+		net_udp_send_op ctx s data
 	| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, args) ->
 		(match sys_surface_operand ctx c cf args with
 		| Some o -> o
@@ -1432,6 +1449,25 @@ and materialize_owned ctx e : (string * operand) option =
 	| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, n :: _)
 		when s_type_path c.cl_path = "Sys" && cf.cf_name = "getEnv" ->
 		materialize_env_get ctx n
+	| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, [s; maxv])
+		when s_type_path c.cl_path = "sa.net.Udp" && cf.cf_name = "recv" ->
+		(match gen_operand ctx s with
+		| Imm _ -> None
+		| Reg r ->
+			let ms = match gen_operand ctx maxv with
+				| Imm x -> x | Reg rr -> rr in
+			let buf = fresh ctx "t" in
+			emit ctx (Printf.sprintf "%s = alloc %s" buf ms);
+			track ctx buf;
+			let st = fresh ctx "t" in
+			let n = fresh ctx "t" in
+			emit ctx (Printf.sprintf "EXPAND NET_UDP_RECV %s, %s, %s, %s, %s"
+				st n r buf ms);
+			track ctx st;
+			track ctx n;
+			panic_unless_ok ctx st "haxe:net-udp-recv";
+			release_now ctx st;
+			Some (buf, Reg n))
 	| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, _)
 		when s_type_path c.cl_path = "Sys" && cf.cf_name = "getCwd" ->
 		materialize_cwd ctx
@@ -2296,6 +2332,25 @@ and gen_stmt ctx e =
 		(match gen_operand ctx lnr with
 		| Imm s -> ignore (net_close_stmt ctx s); false
 		| Reg r -> ignore (net_close_stmt ctx r); false)
+	| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, [s; ms])
+		when (s_type_path c.cl_path = "sa.net.Tcp"
+			|| s_type_path c.cl_path = "sa.net.Udp")
+			&& cf.cf_name = "setReadTimeout" ->
+		ignore (net_set_timeout_stmt ctx s ms
+			(s_type_path c.cl_path = "sa.net.Udp")); false
+	| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, [s])
+		when s_type_path c.cl_path = "sa.net.Tcp" && cf.cf_name = "closeStream" ->
+		ignore (net_stream_close_stmt ctx s false); false
+	| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, [s])
+		when s_type_path c.cl_path = "sa.net.Udp" && cf.cf_name = "close" ->
+		ignore (net_stream_close_stmt ctx s true); false
+	| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, [s; host; port])
+		when s_type_path c.cl_path = "sa.net.Udp" && cf.cf_name = "connect" ->
+		(match gen_operand ctx s with
+		| Imm _ ->
+			comment ctx "SA-TODO(v0.23): udp connect needs socket register";
+			false
+		| Reg r -> ignore (net_udp_connect_stmt ctx r host port); false)
 	| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, args) ->
 		if sys_surface_stmt ctx c cf args then false
 		else (match s_type_path c.cl_path, cf.cf_name, args with
@@ -2572,7 +2627,7 @@ and net_listen_op ctx port =
 	track ctx st;
 	track ctx lnr;
 	track ctx dp;
-	panic_unless_ok ctx st;
+	panic_unless_ok ctx st "haxe:net-listen";
 	release_now ctx st;
 	release_now ctx dp;
 	Reg lnr
@@ -2584,7 +2639,7 @@ and net_bound_port_op ctx lnr =
 		st addr lnr);
 	track ctx st;
 	track ctx addr;
-	panic_unless_ok ctx st;
+	panic_unless_ok ctx st "haxe:net-local-addr";
 	release_now ctx st;
 	let port = fresh ctx "t" in
 	emit ctx (Printf.sprintf "EXPAND NET_ADDR_PORT %s, %s" port addr);
@@ -2600,9 +2655,155 @@ and net_close_stmt ctx lnr =
 	let st = fresh ctx "t" in
 	emit ctx (Printf.sprintf "EXPAND NET_TCP_LISTENER_CLOSE %s, %s" st lnr);
 	track ctx st;
-	panic_unless_ok ctx st;
+	panic_unless_ok ctx st "haxe:net-close";
 	release_now ctx st;
 	true
+
+(** v0.23 TCP/UDP stream surface over existing `NET_TCP_*` / `NET_UDP_*`
+	macros (zero new ABI). Status-checked calls panic loudly; u64
+	handles flow through `UInt` regs. String results use the
+	`__retlen` convention via materialize. *)
+and net_tcp_connect_op ctx host_e port_e =
+	match string_operands ctx host_e with
+	| Some (hp, hl) ->
+		let ps = match gen_operand ctx port_e with
+			| Imm s -> s | Reg r -> r in
+		let st = fresh ctx "t" in
+		let s = fresh ctx "t" in
+		emit ctx (Printf.sprintf "EXPAND NET_TCP_CONNECT %s, %s, %s, %s, %s"
+			st s hp hl ps);
+		track ctx st;
+		track ctx s;
+		panic_unless_ok ctx st "haxe:net-connect";
+		release_now ctx st;
+		Reg s
+	| None ->
+		comment ctx "SA-TODO(v0.23): connect needs resolvable host";
+		Imm "0"
+
+and net_tcp_write_op ctx stream_e data_e =
+	match gen_operand ctx stream_e with
+	| Imm _ ->
+		comment ctx "SA-TODO(v0.23): write needs stream register";
+		Imm "0"
+	| Reg ss ->
+	match string_operands ctx data_e with
+	| Some (dp, dl) ->
+		let st = fresh ctx "t" in
+		let n = fresh ctx "t" in
+		emit ctx (Printf.sprintf "EXPAND NET_TCP_STREAM_WRITE %s, %s, %s, %s, %s"
+			st n ss dp dl);
+		track ctx st;
+		track ctx n;
+		panic_unless_ok ctx st "haxe:net-write";
+		release_now ctx st;
+		Reg n
+	| None ->
+		comment ctx "SA-TODO(v0.23): write needs resolvable data";
+		Imm "0"
+
+and net_set_timeout_stmt ctx stream_e ms_e is_udp =
+	match gen_operand ctx stream_e with
+	| Imm _ ->
+		comment ctx "SA-TODO(v0.23): timeout needs stream register";
+		false
+	| Reg ss ->
+	let vs = match gen_operand ctx ms_e with
+		| Imm s -> s | Reg r -> r in
+	let ns = fresh ctx "t" in
+	emit ctx (Printf.sprintf "%s = mul %s, 1000000" ns vs);
+	track ctx ns;
+	let st = fresh ctx "t" in
+	let mn = if is_udp then "NET_UDP_SET_READ_TIMEOUT" else "NET_TCP_STREAM_SET_READ_TIMEOUT" in
+	emit ctx (Printf.sprintf "EXPAND %s %s, %s, %s" mn st ss ns);
+	track ctx st;
+	panic_unless_ok ctx st "haxe:net-timeout";
+	release_now ctx st;
+	release_now ctx ns;
+	true
+
+and net_stream_close_stmt ctx stream_e is_udp =
+	match gen_operand ctx stream_e with
+	| Imm _ ->
+		comment ctx "SA-TODO(v0.23): close needs stream register";
+		false
+	| Reg ss ->
+	let st = fresh ctx "t" in
+	let mn = if is_udp then "NET_UDP_CLOSE" else "NET_TCP_STREAM_CLOSE" in
+	emit ctx (Printf.sprintf "EXPAND %s %s, %s" mn st ss);
+	track ctx st;
+	panic_unless_ok ctx st "haxe:net-stream-close";
+	release_now ctx st;
+	true
+
+and net_udp_bind_op ctx port_e =
+	let ps = match gen_operand ctx port_e with
+		| Imm s -> s | Reg r -> r in
+	let (hn, hl) = intern_string ctx "127.0.0.1" in
+	let st = fresh ctx "t" in
+	let s = fresh ctx "t" in
+	emit ctx (Printf.sprintf "EXPAND NET_UDP_BIND %s, %s, &%s, %d, %s"
+		st s hn hl ps);
+	track ctx st;
+	track ctx s;
+	panic_unless_ok ctx st "haxe:net-udp-bind";
+	release_now ctx st;
+	Reg s
+
+and net_udp_port_op ctx s =
+	let st = fresh ctx "t" in
+	let addr = fresh ctx "t" in
+	emit ctx (Printf.sprintf "EXPAND NET_UDP_LOCAL_ADDR %s, %s, %s" st addr s);
+	track ctx st;
+	track ctx addr;
+	panic_unless_ok ctx st "haxe:net-udp-addr";
+	release_now ctx st;
+	let port = fresh ctx "t" in
+	emit ctx (Printf.sprintf "EXPAND NET_ADDR_PORT %s, %s" port addr);
+	track ctx port;
+	let st2 = fresh ctx "t" in
+	emit ctx (Printf.sprintf "EXPAND NET_ADDR_FREE %s, %s" st2 addr);
+	track ctx st2;
+	release_now ctx st2;
+	release_now ctx addr;
+	Reg port
+
+and net_udp_connect_stmt ctx s host_e port_e =
+	match string_operands ctx host_e with
+	| Some (hp, hl) ->
+		let ps = match gen_operand ctx port_e with
+			| Imm x -> x | Reg r -> r in
+		let st = fresh ctx "t" in
+		emit ctx (Printf.sprintf "EXPAND NET_UDP_CONNECT %s, %s, %s, %s, %s"
+			st s hp hl ps);
+		track ctx st;
+		panic_unless_ok ctx st "haxe:net-udp-connect";
+		release_now ctx st;
+		true
+	| None ->
+		comment ctx "SA-TODO(v0.23): udp connect needs resolvable host";
+		false
+
+and net_udp_send_op ctx s_e data_e =
+	match gen_operand ctx s_e with
+	| Imm _ ->
+		comment ctx "SA-TODO(v0.23): udp send needs socket register";
+		Imm "0"
+	| Reg s ->
+	match string_operands ctx data_e with
+	| Some (dp, dl) ->
+		let st = fresh ctx "t" in
+		let n = fresh ctx "t" in
+		emit ctx (Printf.sprintf "EXPAND NET_UDP_SEND %s, %s, %s, %s, %s"
+			st n s dp dl);
+		track ctx st;
+		track ctx n;
+		panic_unless_ok ctx st "haxe:net-udp-send";
+		release_now ctx st;
+		Reg n
+	| None ->
+		comment ctx "SA-TODO(v0.23): udp send needs resolvable data";
+		Imm "0"
 
 and gen_call ctx c cf args =
 	let name = sa_fun_name c cf in

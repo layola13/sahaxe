@@ -66,34 +66,52 @@ L_ENTRY:
     var1 = stack_alloc 8
     var2 = stack_alloc 8
     EXPAND NET_TCP_LISTENER_BIND_PORT t3, t4, t5, &STR_0, 9, 0
+    t6 = eq t3, 0
+    br t6 -> L_NETOK0, L_NETFAIL1
+L_NETFAIL1:
+    panic("haxe:net-listen")
+L_NETOK0:
+    !t6
     !t3
     !t5
     store var1+0, t4 as ptr
-    t6 = load var1+0 as ptr
-    EXPAND NET_TCP_LISTENER_LOCAL_ADDR t7, t8, t6
-    !t7
-    EXPAND NET_ADDR_PORT t9, t8
-    EXPAND NET_ADDR_FREE t10, t8
+    t7 = load var1+0 as ptr
+    EXPAND NET_TCP_LISTENER_LOCAL_ADDR t8, t9, t7
+    t10 = eq t8, 0
+    br t10 -> L_NETOK2, L_NETFAIL3
+L_NETFAIL3:
+    panic("haxe:net-local-addr")
+L_NETOK2:
     !t10
     !t8
-    store var2+0, t9 as i32
-    t11 = load var1+0 as ptr
-    EXPAND NET_TCP_LISTENER_CLOSE t12, t11
+    EXPAND NET_ADDR_PORT t11, t9
+    EXPAND NET_ADDR_FREE t12, t9
     !t12
-    t13 = load var2+0 as i32
-    t14 = sgt t13, 0
-    br t14 -> L_THEN0, L_ELSE2
-L_THEN0:
-    call @sa_print_bytes(&STR_1, 6)
-    jmp L_ENDIF1
-L_ELSE2:
-    call @sa_print_bytes(&STR_2, 7)
-    jmp L_ENDIF1
-L_ENDIF1:
-    !t4
-    !t6
     !t9
+    store var2+0, t11 as i32
+    t13 = load var1+0 as ptr
+    EXPAND NET_TCP_LISTENER_CLOSE t14, t13
+    t15 = eq t14, 0
+    br t15 -> L_NETOK4, L_NETFAIL5
+L_NETFAIL5:
+    panic("haxe:net-close")
+L_NETOK4:
+    !t15
+    !t14
+    t16 = load var2+0 as i32
+    t17 = sgt t16, 0
+    br t17 -> L_THEN6, L_ELSE8
+L_THEN6:
+    call @sa_print_bytes(&STR_1, 6)
+    jmp L_ENDIF7
+L_ELSE8:
+    call @sa_print_bytes(&STR_2, 7)
+    jmp L_ENDIF7
+L_ENDIF7:
+    !t4
+    !t7
     !t11
     !t13
-    !t14
+    !t16
+    !t17
     return 0

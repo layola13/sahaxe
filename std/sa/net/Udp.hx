@@ -23,32 +23,31 @@
 package sa.net;
 
 /**
-	Minimal TCP surface over `sci/sa_std` net contracts (v0.18).
+	Minimal UDP surface over `sci/sa_std` net contracts (v0.23).
 
-	Handles are opaque `UInt` values (64-bit slots, mirroring the ts
-	plugin's i32-handle convention widened to full width). All calls
-	lower directly to `NET_TCP_*` macros / `sa_std_net_*` externs;
-	failures abort loudly via `panic` (same posture as fs).
+	Handles are opaque `UInt` values like `Tcp`. Failures abort loudly
+	via `panic`. `recv` returns the datagram bytes (`__retlen`
+	convention shared with String returns).
 **/
-extern class Tcp {
-	/** Bind 127.0.0.1:port (0 = ephemeral), returns listener handle. */
-	public static function listen(port:Int):UInt;
+extern class Udp {
+	/** Bind 127.0.0.1:port (0 = ephemeral), returns socket handle. */
+	public static function bind(port:Int):UInt;
 
-	/** Bound port of a listener created with port 0. */
-	public static function boundPort(listener:UInt):Int;
+	/** Bound port of a socket created with port 0. */
+	public static function port(socket:UInt):Int;
 
-	/** Close a listener. */
-	public static function close(listener:UInt):Void;
+	/** Connect a socket to a peer (loopback to self works). */
+	public static function connect(socket:UInt, host:String, port:Int):Void;
 
-	/** Connect to a peer, returns stream handle (panics on failure). */
-	public static function connect(host:String, port:Int):UInt;
+	/** Send bytes to the connected peer, returns bytes sent. */
+	public static function send(socket:UInt, data:String):Int;
 
-	/** Write bytes, returns bytes written. */
-	public static function write(stream:UInt, data:String):Int;
+	/** Receive one datagram (up to maxBytes). */
+	public static function recv(socket:UInt, maxBytes:Int):String;
 
 	/** Set the read timeout in milliseconds. */
-	public static function setReadTimeout(stream:UInt, ms:Int):Void;
+	public static function setReadTimeout(socket:UInt, ms:Int):Void;
 
-	/** Close a stream. */
-	public static function closeStream(stream:UInt):Void;
+	/** Close a socket. */
+	public static function close(socket:UInt):Void;
 }

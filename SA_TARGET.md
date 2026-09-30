@@ -199,4 +199,8 @@ struct 20%, array 10%)。按用户指令：基础特性优先，其次 hxml，�
   裸泛型在调用点输出可操作指引 (`SA-NOTE` 加 `@:generic`)，
   因完整单态化需 texpr 级类型代换 (超出单轮 scope)；
   fixture BareGen；24 fixture 全绿。
+- v0.23: TCP/UDP 流 (connect/write/read/close/setTimeout 经
+  `NET_TCP_*`/`NET_UDP_*` 宏；UDP 自环回确定性验证；
+  另修复 v0.18 状态检查偏应用无声失效)；
+  `sa.net.Udp` + fixture NetStream；25 fixture 全绿。
 - 每个版本独立提交并推送，`sa_std` 缺失先补 `sci/sa_std`。
