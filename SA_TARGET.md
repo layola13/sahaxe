@@ -170,4 +170,7 @@ struct 20%, array 10%)。按用户指令：基础特性优先，其次 hxml，�
 - v0.13: String 入参函数 (`name_ptr: ptr, name_len: u64` 双参改写，
   调用点 pair 拼接，长度表复用；trace 非字面量一律 `&pslot`)；
   fixture StrParam；15 fixture Referee 全绿。
+- v0.14: 可存 computed-string (concat/fmt 物化自有堆 + 出口释放，
+  句柄即时 free；嵌套 concat 递归物化)；fixture StrStore；
+  16 fixture Referee 全绿。
 - 每个版本独立提交并推送，`sa_std` 缺失先补 `sci/sa_std`。

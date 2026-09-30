@@ -726,11 +726,22 @@ let rec gen_operand ctx e =
 	| TBinop (OpAssign, { eexpr = TLocal v }, rhs) -> begin
 		try
 			let slot = Hashtbl.find ctx.vars v.v_id in
+			if is_string_t v.v_type then begin
+				match materialize_owned ctx rhs with
+				| Some (p, lop) ->
+					emit ctx (Printf.sprintf "store %s+0, %s as ptr" slot p);
+					Hashtbl.replace ctx.str_lens v.v_id lop;
+					Imm p
+				| None ->
+					comment ctx "SA-TODO(v0.14): unmaterializable string assign";
+					Imm "0"
+			end else begin
 			let op = gen_operand ctx rhs in
 			let ty = mem_ty v.v_type in
 			let os = match op with Imm s -> s | Reg r -> r in
 			emit ctx (Printf.sprintf "store %s+0, %s as %s" slot os ty);
 			op
+			end
 		with Not_found ->
 			comment ctx ("SA-TODO(v0.2): assign to unhomed " ^ v.v_name);
 			Imm "0"
@@ -1205,6 +1216,121 @@ and gen_string_eq ctx op e1 e2 =
 		comment ctx "SA-TODO(v0.6): string compare needs tracked lengths";
 		Imm "0"
 
+(** Materialize any string expression to a (ptr, len-operand) pair.
+	Literals/views resolve without copying; concat/fmt build an owned
+	heap (tracked for exit release) with handles freed eagerly. All
+	contracts pre-exist in sci/sa_std. Stored results make
+	`var s = a + b` work; immediate callers use the pair directly. *)
+and materialize_owned ctx e : (string * operand) option =
+	match string_operands ctx e with
+	| Some (p, l) ->
+		let lop = (try ignore (int_of_string l); Imm l with _ -> Reg l) in
+		Some (p, lop)
+	| None -> match e.eexpr with
+	| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, [arg])
+		when s_type_path c.cl_path = "Std" && cf.cf_name = "string" ->
+		materialize_fmt ctx arg
+	| TBinop (OpAdd, l, r) when is_string_t e.etype ->
+		materialize_concat_owned ctx l r
+	| TParenthesis e1 | TMeta (_, e1) | TCast (e1, _) ->
+		materialize_owned ctx e1
+	| _ -> None
+
+(** Owned copy of a registry handle (fmt/concat/env/fs): data/len out,
+	bytes copied to fresh heap, handle freed. Returns (own, Reg len). *)
+and owned_of_handle ctx h data_fn len_fn free_fn =
+	let d = fresh ctx "t" in
+	emit ctx (Printf.sprintf "%s = call @%s(%s)" d data_fn h);
+	track ctx d;
+	let l = fresh ctx "t" in
+	emit ctx (Printf.sprintf "%s = call @%s(%s)" l len_fn h);
+	track ctx l;
+	let own = fresh ctx "t" in
+	emit ctx (Printf.sprintf "%s = alloc %s" own l);
+	track ctx own;
+	emit ctx (Printf.sprintf "call @sa_mem_copy(&%s, &%s, %s)" own d l);
+	let f = fresh ctx "t" in
+	emit ctx (Printf.sprintf "%s = call @%s(^%s)" f free_fn h);
+	track ctx f;
+	forget ctx h;
+	release_now ctx d;
+	release_now ctx f;
+	(own, Reg l)
+
+and materialize_fmt ctx arg =
+	match follow arg.etype with
+	| TAbstract ({ a_path = ([], "Int") }, _) ->
+		let vs = match gen_operand ctx arg with
+			| Imm s -> s | Reg r -> r in
+		let h = fresh ctx "h" in
+		emit ctx (Printf.sprintf "%s = call @sa_fmt_i64(%s, 10)" h vs);
+		track ctx h;
+		Some (owned_of_handle ctx h "sa_fmt_buffer_data" "sa_fmt_buffer_len" "sa_fmt_buffer_free")
+	| TAbstract ({ a_path = ([], "Float") }, _) ->
+		let vs = match gen_operand ctx arg with
+			| Imm s -> s | Reg r -> r in
+		let h = fresh ctx "h" in
+		emit ctx (Printf.sprintf "%s = call @sa_fmt_f64(%s, 6)" h vs);
+		track ctx h;
+		Some (owned_of_handle ctx h "sa_fmt_buffer_data" "sa_fmt_buffer_len" "sa_fmt_buffer_free")
+	| _ -> None
+
+and materialize_concat_owned ctx l r =
+	let rec flatten acc e = match e.eexpr with
+		| TBinop (OpAdd, a, b) when is_string_t e.etype ->
+			flatten (flatten acc a) b
+		| TParenthesis e1 | TMeta (_, e1) | TCast (e1, _) -> flatten acc e1
+		| _ -> acc @ [e] in
+	let parts = flatten (flatten [] l) r in
+	let resolved = List.map (materialize_owned ctx) parts in
+	if List.length parts < 2 || List.exists ((=) None) resolved then None
+	else begin
+		let pairs = List.map (function Some x -> x | None -> ("", Imm "0")) resolved in
+		let opstr = function Imm s -> s | Reg rr -> rr in
+		let (p0, l0) = List.hd pairs in
+		let cur_h = ref "" in
+		let step pa la pb lb first =
+			let h = fresh ctx "h" in
+			emit ctx (Printf.sprintf "%s = call @sa_string_concat(%s, %s, %s, %s)"
+				h pa la pb lb);
+			track ctx h;
+			if not first then begin
+				let f = fresh ctx "t" in
+				emit ctx (Printf.sprintf "%s = call @sa_fmt_buffer_free(^%s)" f !cur_h);
+				track ctx f;
+				release_now ctx f;
+				forget ctx !cur_h
+			end;
+			cur_h := h in
+		(match pairs with
+		| (p0, l0) :: (p1, l1) :: rest ->
+			step p0 (opstr l0) p1 (opstr l1) true;
+			List.iter (fun (pn, ln) ->
+				let d = fresh ctx "t" in
+				emit ctx (Printf.sprintf "%s = call @sa_fmt_buffer_data(%s)" d !cur_h);
+				track ctx d;
+				let ln2 = fresh ctx "t" in
+				emit ctx (Printf.sprintf "%s = call @sa_fmt_buffer_len(%s)" ln2 !cur_h);
+				track ctx ln2;
+				let h2 = fresh ctx "h" in
+				emit ctx (Printf.sprintf "%s = call @sa_string_concat(%s, %s, %s, %s)"
+					h2 d ln2 pn (opstr ln));
+				track ctx h2;
+				let f = fresh ctx "t" in
+				emit ctx (Printf.sprintf "%s = call @sa_fmt_buffer_free(^%s)" f !cur_h);
+				track ctx f;
+				release_now ctx d;
+				release_now ctx ln2;
+				release_now ctx f;
+				forget ctx !cur_h;
+				cur_h := h2
+			) rest
+		| _ -> ());
+		if !cur_h = "" then None
+		else Some (owned_of_handle ctx !cur_h
+			"sa_fmt_buffer_data" "sa_fmt_buffer_len" "sa_fmt_buffer_free")
+	end
+
 (** Print a computed string directly without storing it.
 	`Std.string(int)` flows through `sa_fmt_i64`, `a + b` through
 	`sa_string_concat`; both return registry handles read via the
@@ -1636,9 +1762,23 @@ and gen_stmt ctx e =
 				let s = fresh ctx "var" in
 				Hashtbl.replace ctx.vars v.v_id s;
 				emit ctx (Printf.sprintf "%s = stack_alloc 8" s);
-				track ctx s;
 				s
 		in
+		if is_string_t v.v_type then begin
+			(match init with
+			| Some ie -> (match materialize_owned ctx ie with
+				| Some (p, lop) ->
+					emit ctx (Printf.sprintf "store %s+0, %s as ptr" slot p);
+					Hashtbl.replace ctx.str_lens v.v_id lop;
+					false
+				| None ->
+					comment ctx "SA-TODO(v0.14): unmaterializable string init";
+					emit ctx (Printf.sprintf "store %s+0, 0 as ptr" slot);
+					false)
+			| None ->
+				emit ctx (Printf.sprintf "store %s+0, 0 as ptr" slot);
+				false)
+		end else begin
 		let ty = mem_ty v.v_type in
 		let valu = match init with
 			| Some ie -> begin match gen_operand ctx ie with
@@ -1648,6 +1788,7 @@ and gen_stmt ctx e =
 		emit ctx (Printf.sprintf "store %s+0, %s as %s" slot valu ty);
 		track_str_len ctx v init;
 		false
+		end
 	| TReturn ret ->
 		let keep = match ret with
 			| Some re -> begin match gen_operand ctx re with
