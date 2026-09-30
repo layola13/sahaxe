@@ -59,6 +59,11 @@ type ctx = {
 	mutable next_label : int;
 	vars : (int, string) Hashtbl.t;
 	mutable live : string list;
+	(** Emitted helper functions (SA name -> unit), pre-registered so
+		recursion and forward calls resolve during lowering. *)
+	emitted : (string, unit) Hashtbl.t;
+	(** Out-of-line helper bodies, spliced after @main. *)
+	funcs : Buffer.t;
 	(** Loop stack: (end_label, cond_label, entry_snap, cond_snap).
 		`entry_snap` is the live length at loop entry (plain vars);
 		`cond_snap` the length after the condition is evaluated
@@ -151,6 +156,104 @@ let expr_kind e =
 	| TThrow _ -> "TThrow" | TCast _ -> "TCast" | TMeta _ -> "TMeta"
 	| TEnumParameter _ -> "TEnumParameter" | TEnumIndex _ -> "TEnumIndex"
 	| TIdent _ -> "TIdent"
+
+let sa_fun_name c cf =
+	"hx_" ^ String.concat "_" (fst c.cl_path @ [snd c.cl_path]) ^ "_" ^ cf.cf_name
+
+(** Scalar return annotation (None = not a plain scalar signature). *)
+let scalar_ret t =
+	match follow t with
+	| TAbstract ({ a_path = ([], "Int") }, _)
+	| TAbstract ({ a_path = ([], "Bool") }, _) -> Some "i32"
+	| TAbstract ({ a_path = ([], "Float") }, _) -> Some "f64"
+	| TAbstract ({ a_path = ([], "Void") }, _) -> Some "void"
+	| _ -> None
+
+let scalar_param t = match scalar_ret t with
+	| Some "void" -> None
+	| x -> x
+
+(** A static helper is emittable when it is a plain method with a body
+	and an all-scalar signature (by-value ints/floats/bools only;
+	borrow/move prefixes for aggregate params are v0.6). *)
+let emittable_static cf =
+	match cf.cf_kind with
+	| Method MethNormal | Method MethInline -> begin
+		match cf.cf_expr with
+		| Some { eexpr = TFunction tf } -> begin
+			match follow cf.cf_type with
+			| TFun (args, ret) ->
+				let ptys = List.map (fun (_, _, t) -> scalar_param t) args in
+				if List.exists ((=) None) ptys then None
+				else (match scalar_ret ret with
+					| None -> None
+					| Some rt -> Some (tf,
+						List.map (function Some s -> s | None -> "") ptys, rt))
+			| _ -> None
+		end
+		| _ -> None
+	end
+	| _ -> None
+
+let new_fun_ctx com header emitted funcs = {
+	com; buf = Buffer.create 2048; header;
+	next_reg = 0; next_str = 0; next_label = 0;
+	vars = Hashtbl.create 16; live = []; loops = [];
+	emitted; funcs;
+}
+
+(** Resolve the entry body: `main_expr` is usually a `TCall` to the
+	static `main` method (or a `TBlock` ending in the `EntryPoint.run`
+	call). Returns the statements, whether the entry takes arguments,
+	and the main class (whose statics become SA helpers). *)
+
+let callee_kind e =
+	match e.eexpr with
+	| TIdent s -> "Ident:" ^ s
+	| TField (_, FStatic (c, f)) -> "FStatic:" ^ s_type_path c.cl_path ^ "." ^ f.cf_name
+	| TField (_, FInstance (c, _, f)) -> "FInstance:" ^ s_type_path c.cl_path ^ "." ^ f.cf_name
+	| TField _ -> "FOther"
+	| TLocal v -> "Local:" ^ v.v_name
+	| TConst _ -> "Const"
+	| _ -> "Other"
+
+let gen_trace ctx args =
+	match args with
+	| { eexpr = TConst (TString s) } :: _ ->
+		let (name, len) = intern_string ctx s in
+		emit ctx (Printf.sprintf "call @sa_print_bytes(&%s, %d)" name len)
+	| _ ->
+		comment ctx "SA-TODO(v0.2): trace of non-literal (needs fmt buffer)"
+
+
+let release_all_except ctx keep =
+	List.iter (fun r ->
+		match keep with
+		| Some k when k = r -> ()
+		| _ -> emit ctx ("!" ^ r)
+	) (List.rev ctx.live);
+	ctx.live <- (match keep with Some k -> [k] | None -> [])
+
+(** Arm-local cleanup (Phi consistency, see sala 06_limitations):
+	release registers created after the snapshot so that every edge
+	arriving at a merge label carries the same live set. *)
+let snapshot ctx = List.length ctx.live
+
+let release_since ctx n =
+	let rec split i acc rest =
+		if i <= 0 then (List.rev acc, rest)
+		else match rest with
+			| [] -> (List.rev acc, [])
+			| r :: rs -> split (i - 1) (r :: acc) rs
+	in
+	let (fresh_regs, outer) = split (List.length ctx.live - n) [] ctx.live in
+	List.iter (fun r -> emit ctx ("!" ^ r)) (List.rev fresh_regs);
+	ctx.live <- outer
+
+(** Pre-pass: collect every `let` in the entry statements (including
+	inside `if`/`while` bodies) so `stack_alloc`s can be hoisted above
+	all branches. Branch-local `stack_alloc` would trap with
+	`PhiStateConflict` (see sala 06_limitations). *)
 
 let rec gen_operand ctx e =
 	match e.eexpr with
@@ -254,6 +357,8 @@ let rec gen_operand ctx e =
 		gen_field_set ctx obj cf.cf_name rhs
 	| TObjectDecl decls -> gen_object_decl ctx decls
 	| TField (obj, FAnon cf) -> gen_field_get ctx obj cf.cf_name
+	| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, args) ->
+		gen_call ctx c cf args
 	| TBinop (op, e1, e2) -> gen_binop ctx op e1 e2 e.etype
 	| TParenthesis e1 | TMeta (_, e1) -> gen_operand ctx e1
 	| TCast (e1, _) -> gen_operand ctx e1
@@ -456,34 +561,32 @@ and gen_binop ctx op e1 e2 etype =
 		track ctx r;
 		Reg r
 
-(** Resolve the entry body: `main_expr` is usually a `TCall` to the
-	static `main` method (or a `TBlock` ending in the `EntryPoint.run`
-	call). Returns the statements to lower plus whether the entry
-	function takes arguments (v0.2 only handles argless mains). *)
-let rec entry_stmts e =
+(** SA name for a Haxe static: `hx_<flat path>_<method>`. *)
+and entry_stmts e =
 	match e.eexpr with
 	| TBlock el ->
-		List.fold_left (fun (ss, a) s ->
-			let (ss2, a2) = entry_stmts s in (ss @ ss2, a || a2)
-		) ([], false) el
+		List.fold_left (fun (ss, a, c) s ->
+			let (ss2, a2, c2) = entry_stmts s in
+			(ss @ ss2, a || a2, match c with Some _ -> c | None -> c2)
+		) ([], false, None) el
 	| TMeta (_, e1) | TParenthesis e1 | TCast (e1, _) -> entry_stmts e1
-	| TCall ({ eexpr = TField (_, FStatic (_, cf)) }, _) -> begin
+	| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, _) -> begin
 		match cf.cf_expr with
 		| Some { eexpr = TFunction tf } ->
 			let body = match tf.tf_expr.eexpr with
 				| TBlock el -> el
 				| _ -> [tf.tf_expr]
 			in
-			(body, tf.tf_args <> [])
-		| Some other -> ([other], false)
-		| _ -> ([], false)
+			(body, tf.tf_args <> [], Some c)
+		| Some other -> ([other], false, Some c)
+		| _ -> ([], false, None)
 	end
-	| TFunction tf -> ([tf.tf_expr], false)
-	| _ -> ([e], false)
+	| TFunction tf -> ([tf.tf_expr], false, None)
+	| _ -> ([e], false, None)
 
 (** Callee expression names a `trace`-like function. Covers both the
 	global `trace(...)` call and `haxe.Log.trace(...)`. *)
-let rec callee_is_trace e =
+and callee_is_trace e =
 	match e.eexpr with
 	| TIdent "trace" -> true
 	| TField (_, FStatic (_, { cf_name = "trace" })) -> true
@@ -491,54 +594,7 @@ let rec callee_is_trace e =
 	| TParenthesis e1 | TMeta (_, e1) | TCast (e1, _) -> callee_is_trace e1
 	| _ -> false
 
-let callee_kind e =
-	match e.eexpr with
-	| TIdent s -> "Ident:" ^ s
-	| TField (_, FStatic (c, f)) -> "FStatic:" ^ s_type_path c.cl_path ^ "." ^ f.cf_name
-	| TField (_, FInstance (c, _, f)) -> "FInstance:" ^ s_type_path c.cl_path ^ "." ^ f.cf_name
-	| TField _ -> "FOther"
-	| TLocal v -> "Local:" ^ v.v_name
-	| TConst _ -> "Const"
-	| _ -> "Other"
-
-let gen_trace ctx args =
-	match args with
-	| { eexpr = TConst (TString s) } :: _ ->
-		let (name, len) = intern_string ctx s in
-		emit ctx (Printf.sprintf "call @sa_print_bytes(&%s, %d)" name len)
-	| _ ->
-		comment ctx "SA-TODO(v0.2): trace of non-literal (needs fmt buffer)"
-
-
-let release_all_except ctx keep =
-	List.iter (fun r ->
-		match keep with
-		| Some k when k = r -> ()
-		| _ -> emit ctx ("!" ^ r)
-	) (List.rev ctx.live);
-	ctx.live <- (match keep with Some k -> [k] | None -> [])
-
-(** Arm-local cleanup (Phi consistency, see sala 06_limitations):
-	release registers created after the snapshot so that every edge
-	arriving at a merge label carries the same live set. *)
-let snapshot ctx = List.length ctx.live
-
-let release_since ctx n =
-	let rec split i acc rest =
-		if i <= 0 then (List.rev acc, rest)
-		else match rest with
-			| [] -> (List.rev acc, [])
-			| r :: rs -> split (i - 1) (r :: acc) rs
-	in
-	let (fresh_regs, outer) = split (List.length ctx.live - n) [] ctx.live in
-	List.iter (fun r -> emit ctx ("!" ^ r)) (List.rev fresh_regs);
-	ctx.live <- outer
-
-(** Pre-pass: collect every `let` in the entry statements (including
-	inside `if`/`while` bodies) so `stack_alloc`s can be hoisted above
-	all branches. Branch-local `stack_alloc` would trap with
-	`PhiStateConflict` (see sala 06_limitations). *)
-let rec collect_vars acc e =
+and collect_vars acc e =
 	match e.eexpr with
 	| TVar (v, _) -> v :: acc
 	| TBlock el -> List.fold_left collect_vars acc el
@@ -561,7 +617,7 @@ let rec collect_vars acc e =
 	Used to guard `do-while`: its first iteration runs before any
 	condition temps exist, so a direct jump cannot be merged
 	Phi-consistently and falls back to an honest TODO. *)
-let rec has_direct_jump depth e =
+and has_direct_jump depth e =
 	match e.eexpr with
 	| TBreak | TContinue -> depth = 0
 	| TWhile _ -> false
@@ -681,7 +737,8 @@ and gen_stmt ctx e =
 	match e.eexpr with
 	| TBlock el ->
 		let term = ref false in
-		List.iter (fun s -> term := gen_stmt ctx s) el;
+		List.iter (fun s ->
+			if not !term then term := gen_stmt ctx s) el;
 		!term
 	| TVar (v, init) ->
 		let slot =
@@ -814,6 +871,71 @@ and gen_stmt ctx e =
 		comment ctx ("SA-TODO: unsupported statement " ^ expr_kind e);
 		false
 
+and gen_function fctx name tf ptys ret body_stmts =
+	let fvars = List.combine (List.map fst tf.tf_args) ptys in
+	List.iter (fun (v, ty) ->
+		let slot = fresh fctx "var" in
+		Hashtbl.replace fctx.vars v.v_id slot;
+		emit fctx (Printf.sprintf "%s = stack_alloc 8" slot);
+		track fctx slot;
+		emit fctx (Printf.sprintf "store %s+0, %s as %s" slot v.v_name ty)
+	) fvars;
+	let hoist = List.concat (List.map (collect_vars []) body_stmts) in
+	List.iter (fun v ->
+		if not (Hashtbl.mem fctx.vars v.v_id) then begin
+			let slot = fresh fctx "var" in
+			Hashtbl.replace fctx.vars v.v_id slot;
+			emit fctx (Printf.sprintf "%s = stack_alloc 8" slot);
+			track fctx slot
+		end
+	) hoist;
+	let term = ref false in
+	List.iter (fun s -> term := gen_stmt fctx s) body_stmts;
+	if not !term then begin
+		release_all_except fctx None;
+		(match ret with
+		| "void" -> emit fctx "return"
+		| _ -> emit fctx "return 0")
+	end;
+	let b = Buffer.create 2048 in
+	let sig_ = match fvars with
+		| [] -> ""
+		| _ -> List.map (fun (v, ty) -> Printf.sprintf "%s: %s" v.v_name ty) fvars
+			|> String.concat ", " in
+	Buffer.add_string b (Printf.sprintf "
+@%s(%s) -> %s:
+L_ENTRY:
+" name sig_ ret);
+	Buffer.add_string b (Buffer.contents fctx.buf);
+	Buffer.add_string fctx.funcs (Buffer.contents b)
+
+
+
+(** Lower a static call to an emitted helper. Arguments evaluate
+	left-to-right; void calls emit bare `call`, value calls `r = call`. *)
+and gen_call ctx c cf args =
+	let name = sa_fun_name c cf in
+	if not (Hashtbl.mem ctx.emitted name) then begin
+		comment ctx ("SA-TODO(v0.6): call to non-emitted " ^
+			s_type_path c.cl_path ^ "." ^ cf.cf_name);
+		Imm "0"
+	end else begin
+		let ss = List.map (fun a ->
+			match gen_operand ctx a with Imm s -> s | Reg r -> r) args in
+		let ret = match follow cf.cf_type with
+			| TFun (_, r) -> scalar_ret r
+			| _ -> None in
+		match ret with
+		| Some "void" ->
+			emit ctx (Printf.sprintf "call @%s(%s)" name (String.concat ", " ss));
+			Imm "0"
+		| _ ->
+			let r = fresh ctx "t" in
+			emit ctx (Printf.sprintf "%s = call @%s(%s)" r name (String.concat ", " ss));
+			track ctx r;
+			Reg r
+	end
+
 let print_type buf mt =
 	let c =
 		match mt with
@@ -829,18 +951,35 @@ let generate com =
 	let body = Buffer.create 4096 in
 	let header = Buffer.create 512 in
 	let types = Buffer.create 1024 in
+	let funcs = Buffer.create 4096 in
+	let emitted : (string, unit) Hashtbl.t = Hashtbl.create 16 in
 	let ctx = {
 		com; buf = body; header;
 		next_reg = 0; next_str = 0; next_label = 0;
 		vars = Hashtbl.create 16; live = []; loops = [];
+		emitted; funcs;
 	} in
 	List.iter (print_type types) com.types;
-	let (stmts, has_args) = match com.main.main_expr with
+	let (stmts, has_args, main_class) = match com.main.main_expr with
 		| Some e -> entry_stmts e
-		| None -> ([], false)
+		| None -> ([], false, None)
 	in
 	if has_args then comment ctx "SA-TODO(v0.4): entry with args";
 	if stmts = [] then comment ctx "no haxe main entry";
+	(* Pre-register emittable helpers of the main class so calls
+		(including recursion and forward calls) resolve. *)
+	let helpers = match main_class with
+		| None -> []
+		| Some c ->
+			List.filter_map (fun cf ->
+				if cf.cf_name = "main" then None
+				else match emittable_static cf with
+					| None -> None
+					| Some (tf, ptys, ret) ->
+						let name = sa_fun_name c cf in
+						Hashtbl.replace emitted name ();
+						Some (name, tf, ptys, ret)
+			) c.cl_ordered_statics in
 	(* Hoist every `stack_alloc` above all branches (PhiStateConflict). *)
 	List.iter (fun v ->
 		if not (Hashtbl.mem ctx.vars v.v_id) then begin
@@ -850,16 +989,28 @@ let generate com =
 			track ctx slot
 		end
 	) (List.concat (List.map (collect_vars []) stmts));
-	List.iter (fun s -> ignore (gen_stmt ctx s)) stmts;
-	release_all_except ctx None;
-	emit ctx "return 0";
+	let main_term = ref false in
+	List.iter (fun s -> main_term := gen_stmt ctx s) stmts;
+	if not !main_term then begin
+		release_all_except ctx None;
+		emit ctx "return 0"
+	end;
+	(* Lower helper bodies with fresh scopes sharing header/emitted. *)
+	List.iter (fun (name, tf, ptys, ret) ->
+		let fctx = new_fun_ctx com header emitted funcs in
+		let body_stmts = match tf.tf_expr.eexpr with
+			| TBlock el -> el
+			| _ -> [tf.tf_expr] in
+		gen_function fctx name tf ptys ret body_stmts
+	) helpers;
 	let ch = open_out_bin com.file in
-	output_string ch "// Generated by the Haxe SA target v0.4.\n";
-	output_string ch "// Straight-line + if/while + array/object lowering; see SA_TARGET.md.\n";
+	output_string ch "// Generated by the Haxe SA target v0.5.\n";
+	output_string ch "// + static helpers and calls; see SA_TARGET.md.\n";
 	output_string ch "@import \"sa_std/io/print.sai\"\n\n";
 	output_string ch (Buffer.contents header);
 	output_string ch "\n";
 	output_string ch (Buffer.contents types);
 	output_string ch "\n@main() -> i32:\nL_ENTRY:\n";
 	output_string ch (Buffer.contents body);
+	output_string ch (Buffer.contents funcs);
 	close_out ch

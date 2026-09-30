@@ -2,14 +2,17 @@
 // + static helpers and calls; see SA_TARGET.md.
 @import "sa_std/io/print.sai"
 
-@const STR_0 = utf8:"done"
+@const STR_0 = utf8:"add ok"
+@const STR_1 = utf8:"add bad"
+@const STR_2 = utf8:"fact ok"
+@const STR_3 = utf8:"fact bad"
 
 // abstract Any
-// class Arith
 // class Array
 // abstract Class
 // abstract Enum
 // abstract EnumValue
+// class Funcs
 // typedef Map
 // typedef IMap
 // class Math
@@ -58,27 +61,75 @@
 L_ENTRY:
     var0 = stack_alloc 8
     var1 = stack_alloc 8
-    var2 = stack_alloc 8
-    var3 = stack_alloc 8
-    store var0+0, 6 as i32
-    store var1+0, 7 as i32
+    t2 = call @hx_Funcs_add(20, 22)
+    store var0+0, t2 as i32
+    t3 = call @hx_Funcs_fact(5)
+    store var1+0, t3 as i32
     t4 = load var0+0 as i32
-    t5 = load var1+0 as i32
-    t6 = mul t4, t5
-    t7 = add t6, 1
-    store var2+0, t7 as i32
-    t8 = load var2+0 as i32
-    t9 = eq t8, 43
-    store var3+0, t9 as i32
-    call @sa_print_bytes(&STR_0, 4)
+    t5 = eq t4, 42
+    br t5 -> L_THEN0, L_ELSE2
+L_THEN0:
+    call @sa_print_bytes(&STR_0, 6)
+    jmp L_ENDIF1
+L_ELSE2:
+    call @sa_print_bytes(&STR_1, 7)
+    jmp L_ENDIF1
+L_ENDIF1:
+    t6 = load var1+0 as i32
+    t7 = eq t6, 120
+    br t7 -> L_THEN3, L_ELSE5
+L_THEN3:
+    call @sa_print_bytes(&STR_2, 7)
+    jmp L_ENDIF4
+L_ELSE5:
+    call @sa_print_bytes(&STR_3, 8)
+    jmp L_ENDIF4
+L_ENDIF4:
     !var0
     !var1
-    !var2
-    !var3
+    !t2
+    !t3
     !t4
     !t5
     !t6
     !t7
-    !t8
-    !t9
     return 0
+
+@hx_Funcs_add(a: i32, b: i32) -> i32:
+L_ENTRY:
+    var0 = stack_alloc 8
+    store var0+0, a as i32
+    var1 = stack_alloc 8
+    store var1+0, b as i32
+    t2 = load var0+0 as i32
+    t3 = load var1+0 as i32
+    t4 = add t2, t3
+    !var0
+    !var1
+    !t2
+    !t3
+    return t4
+
+@hx_Funcs_fact(n: i32) -> i32:
+L_ENTRY:
+    var0 = stack_alloc 8
+    store var0+0, n as i32
+    t1 = load var0+0 as i32
+    t2 = sle t1, 1
+    br t2 -> L_THEN0, L_ENDIF1
+L_THEN0:
+    !var0
+    !t1
+    !t2
+    return 1
+L_ENDIF1:
+    t3 = load var0+0 as i32
+    t4 = load var0+0 as i32
+    t5 = sub t4, 1
+    t6 = call @hx_Funcs_fact(t5)
+    t7 = mul t3, t6
+    !t3
+    !t4
+    !t5
+    !t6
+    return t7
