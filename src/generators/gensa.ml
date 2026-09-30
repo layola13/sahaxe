@@ -855,6 +855,24 @@ let rec gen_operand ctx e =
 	| TCall ({ eexpr = TField (obj, FInstance (c, _, cf)) }, args)
 		when is_string_map c ->
 		map_method_op ctx obj cf args e.etype
+	| TCall ({ eexpr = TField (obj, FInstance (c, _, cf)) }, args)
+		when s_type_path c.cl_path = "String" ->
+		(match cf.cf_name, args with
+		| ("indexOf", [ndl]) -> (match str_index_of_op ctx obj ndl None false with
+			| Some o -> o
+			| None -> comment ctx "SA-TODO(v0.28): indexOf"; Imm "0")
+		| ("indexOf", [ndl; from]) -> (match str_index_of_op ctx obj ndl (Some from) false with
+			| Some o -> o
+			| None -> comment ctx "SA-TODO(v0.28): indexOf"; Imm "0")
+		| ("lastIndexOf", [ndl]) -> (match str_index_of_op ctx obj ndl None true with
+			| Some o -> o
+			| None -> comment ctx "SA-TODO(v0.28): lastIndexOf"; Imm "0")
+		| ("lastIndexOf", [ndl; from]) -> (match str_index_of_op ctx obj ndl (Some from) true with
+			| Some o -> o
+			| None -> comment ctx "SA-TODO(v0.28): lastIndexOf"; Imm "0")
+		| _ ->
+			comment ctx ("SA-TODO(v0.28): String." ^ cf.cf_name);
+			Imm "0")
 	| TCall ({ eexpr = TField (obj, FInstance (c, _, cf)) }, args) ->
 		gen_method_call ctx c cf obj args
 	| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, args)
@@ -1096,6 +1114,16 @@ let rec gen_operand ctx e =
 	| TArray (base, idx) -> gen_array_get ctx base idx
 	| TField (base, acc) when is_length_access base acc ->
 		gen_array_len ctx base
+	| TField (base, acc) when is_string_t base.etype ->
+		(match field_name_of acc with
+		| Some "length" -> (match string_len_of ctx base with
+			| Some o -> o
+			| None ->
+				comment ctx "SA-TODO(v0.28): string length untracked";
+				Imm "0")
+		| _ ->
+			comment ctx "SA-TODO(v0.28): String field";
+			Imm "0")
 	| TField (obj, FInstance (c, _, cf)) -> gen_ifield_get ctx obj c cf
 	| _ ->
 		comment ctx ("SA-TODO(v0.2/v0.3): unsupported expression " ^ expr_kind e);
@@ -1579,6 +1607,15 @@ and materialize_owned ctx e : (string * operand) option =
 		| _ ->
 			comment ctx "SA-TODO(v0.26): map get needs map register";
 			None)
+	| TCall ({ eexpr = TField (obj, FInstance (c, _, cf)) }, args)
+		when s_type_path c.cl_path = "String" ->
+		(match cf.cf_name, args with
+		| ("substr", [pos]) -> str_substr_op ctx obj pos None
+		| ("substr", [pos; len]) -> str_substr_op ctx obj pos (Some len)
+		| ("toUpperCase", []) -> str_case_op ctx obj true
+		| ("toLowerCase", []) -> str_case_op ctx obj false
+		| ("charAt", [idx]) -> str_char_at_op ctx obj idx
+		| _ -> None)
 	| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, _)
 		when s_type_path c.cl_path = "Sys" && cf.cf_name = "getCwd" ->
 		materialize_cwd ctx
@@ -2197,6 +2234,24 @@ and gen_enum_eq ctx op e1 e2 =
 		comment ctx "SA-TODO(v0.21): enum base must be registers";
 		Imm "0"
 
+(** Field name of any field access (for String.length etc.). *)
+and field_name_of acc =
+	match acc with
+	| FDynamic s -> Some s
+	| FInstance (_, _, f) | FAnon f | FStatic (_, f) -> Some f.cf_name
+	| _ -> None
+
+(** Length operand of a string base (literal / tracked local). *)
+and string_len_of ctx base =
+	match base.eexpr with
+	| TConst (TString s) -> Some (Imm (string_of_int (String.length s)))
+	| TLocal v when is_string_t v.v_type -> begin
+		try Some (Hashtbl.find ctx.str_lens v.v_id)
+		with Not_found -> None
+	end
+	| TParenthesis e1 | TMeta (_, e1) | TCast (e1, _) -> string_len_of ctx e1
+	| _ -> None
+
 and gen_switch ctx sw =
 	let all_pats = List.concat (List.map (fun c -> c.case_patterns) sw.switch_cases) in
 	let str_mode = is_string_t sw.switch_subject.etype in
@@ -2485,6 +2540,10 @@ and gen_stmt ctx e =
 	| TCall ({ eexpr = TField (obj, FInstance (c, _, cf)) }, args)
 		when is_string_map c ->
 		ignore (map_method_op ctx obj cf args e.etype);
+		false
+	| TCall ({ eexpr = TField (_, FInstance (c, _, _)) }, _)
+		when s_type_path c.cl_path = "String" ->
+		ignore (gen_operand ctx e);
 		false
 	| TCall ({ eexpr = TField (obj, FInstance (c, _, cf)) }, args) ->
 		ignore (gen_method_call ctx c cf obj args);
@@ -3562,6 +3621,109 @@ and ereg_matched_pair ctx obj idx =
 		track ctx l;
 		release_now ctx last;
 		Some (g, Reg l)
+
+(** v0.28 `String` methods over existing `string.sai` contracts.
+	`length` reads tracked lengths (never content words). Index/search
+	ops return plain ints; case/substr/charAt materialize owned pairs.
+	`split` stays deferred (needs 16-byte string array elements). *)
+and str_index_of_op ctx obj ndl from is_last =
+	match string_operands ctx obj with
+	| Some (hp, hl) ->
+		(match string_operands ctx ndl with
+		| Some (np, nl) ->
+			let fs = match from with
+				| Some f -> (match gen_operand ctx f with
+					| Imm s -> s | Reg r -> r)
+				| None -> "0" in
+			let mn = if is_last then "sa_string_last_index_of" else "sa_string_index_of" in
+			let r = fresh ctx "t" in
+			emit ctx (Printf.sprintf "%s = call @%s(%s, %s, %s, %s, %s)"
+				r mn hp hl np nl fs);
+			track ctx r;
+			Some (Reg r)
+		| None -> None)
+	| None -> None
+
+and str_case_op ctx obj upper =
+	match string_operands ctx obj with
+	| Some (pp, pl) ->
+		let h = fresh ctx "t" in
+		let mn = if upper then "sa_string_to_upper_ascii" else "sa_string_to_lower_ascii" in
+		emit ctx (Printf.sprintf "%s = call @%s(%s, %s)" h mn pp pl);
+		track ctx h;
+		Some (owned_of_handle ctx h
+			"sa_fmt_buffer_data" "sa_fmt_buffer_len" "sa_fmt_buffer_free")
+	| None -> None
+
+and str_substr_op ctx obj pos len =
+	match string_operands ctx obj with
+	| Some (pp, pl) ->
+		let ps = match gen_operand ctx pos with
+			| Imm s -> s | Reg r -> r in
+		let negp = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = slt %s, 0" negp ps);
+		track ctx negp;
+		let l_bad = fresh_label ctx "STRBAD" in
+		let l_ok = fresh_label ctx "STROK" in
+		emit ctx (Printf.sprintf "br %s -> %s, %s" negp l_bad l_ok);
+		emit_label ctx l_bad;
+		emit ctx "panic(\"haxe:substr-neg\")";
+		emit_label ctx l_ok;
+		release_now ctx negp;
+		let ls = match len with
+			| Some e -> (match gen_operand ctx e with
+				| Imm s -> s | Reg r -> r)
+			| None -> pl in
+		let rem = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = sub %s, %s" rem pl ps);
+		track ctx rem;
+		let c = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = ult %s, %s" c ls rem);
+		track ctx c;
+		let llen = fresh ctx "t" in
+		track ctx llen;
+		let l_use = fresh_label ctx "STRU" in
+		let l_clamp = fresh_label ctx "STRC" in
+		let l_end = fresh_label ctx "STREND" in
+		emit ctx (Printf.sprintf "br %s -> %s, %s" c l_use l_clamp);
+		emit_label ctx l_use;
+		emit ctx (Printf.sprintf "%s = add %s, 0" llen ls);
+		release_now ctx c;
+		release_now ctx rem;
+		emit ctx (Printf.sprintf "jmp %s" l_end);
+		emit_label ctx l_clamp;
+		emit ctx (Printf.sprintf "%s = add %s, 0" llen rem);
+		release_now ctx c;
+		release_now ctx rem;
+		emit ctx (Printf.sprintf "jmp %s" l_end);
+		emit_label ctx l_end;
+		let src = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = ptr_add %s, %s" src pp ps);
+		track ctx src;
+		let own = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = alloc %s" own llen);
+		track ctx own;
+		emit ctx (Printf.sprintf "call @sa_mem_copy(&%s, &%s, %s)" own src llen);
+		release_now ctx src;
+		Some (own, Reg llen)
+	| None -> None
+
+and str_char_at_op ctx obj idx =
+	match string_operands ctx obj with
+	| Some (pp, pl) ->
+		let ii = match gen_operand ctx idx with
+			| Imm s -> s | Reg r -> r in
+		let cp = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = call @sa_string_code_point_at(%s, %s, %s)"
+			cp pp pl ii);
+		track ctx cp;
+		let h = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = call @sa_string_from_code_point(%s)" h cp);
+		track ctx h;
+		release_now ctx cp;
+		Some (owned_of_handle ctx h
+			"sa_fmt_buffer_data" "sa_fmt_buffer_len" "sa_fmt_buffer_free")
+	| None -> None
 
 and gen_call ctx c cf args =
 	let name = sa_fun_name c cf in
