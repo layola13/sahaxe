@@ -679,6 +679,40 @@ let trace_fs_get_content ctx p =
 		true
 	| None -> false
 
+(** Trace a registry-handle string (env/cwd): miss check, print,
+	free. Shared by getEnv/getCwd trace paths. *)
+let trace_handle_string ctx h data_fn len_fn free_fn miss_msg =
+	let is0 = fresh ctx "t" in
+	emit ctx (Printf.sprintf "%s = eq %s, 0" is0 h);
+	track ctx is0;
+	let l_miss = fresh_label ctx "HMISS" in
+	let l_hit = fresh_label ctx "HHIT" in
+	let l_end = fresh_label ctx "HEND" in
+	emit ctx (Printf.sprintf "br %s -> %s, %s" is0 l_miss l_hit);
+	emit_label ctx l_miss;
+	emit ctx (Printf.sprintf "panic(\"%s\")" miss_msg);
+	emit_label ctx l_hit;
+	let ps = (match ctx.pslot with Some s -> s | None -> ensure_pslot ctx) in
+	let d = fresh ctx "t" in
+	emit ctx (Printf.sprintf "%s = call @%s(%s)" d data_fn h);
+	track ctx d;
+	let ln = fresh ctx "t" in
+	emit ctx (Printf.sprintf "%s = call @%s(%s)" ln len_fn h);
+	track ctx ln;
+	emit ctx (Printf.sprintf "store %s+0, %s as ptr" ps d);
+	emit ctx (Printf.sprintf "call @sa_print_bytes(&%s, %s)" ps ln);
+	let f = fresh ctx "t" in
+	emit ctx (Printf.sprintf "%s = call @%s(^%s)" f free_fn h);
+	track ctx f;
+	forget ctx h;
+	release_now ctx is0;
+	release_now ctx d;
+	release_now ctx ln;
+	release_now ctx f;
+	emit ctx (Printf.sprintf "jmp %s" l_end);
+	emit_label ctx l_end;
+	true
+
 (** Trace `Sys.getEnv(name)` directly; missing variable panics. *)
 let trace_sys_getenv ctx n =
 	match string_operands ctx n with
@@ -686,38 +720,46 @@ let trace_sys_getenv ctx n =
 		let h = fresh ctx "h" in
 		emit ctx (Printf.sprintf "%s = call @sa_env_get(%s, %s)" h kp kl);
 		track ctx h;
-		let is0 = fresh ctx "t" in
-		emit ctx (Printf.sprintf "%s = eq %s, 0" is0 h);
-		track ctx is0;
-		let l_miss = fresh_label ctx "ENVMISS" in
-		let l_hit = fresh_label ctx "ENVHIT" in
-		let l_end = fresh_label ctx "ENVEND" in
-		emit ctx (Printf.sprintf "br %s -> %s, %s" is0 l_miss l_hit);
-		emit_label ctx l_miss;
-		emit ctx "panic(\"haxe:env-missing\")";
-		emit_label ctx l_hit;
-		let ps = ensure_pslot ctx in
-		let d = fresh ctx "t" in
-		emit ctx (Printf.sprintf "%s = call @sa_env_buffer_data(%s)" d h);
-		track ctx d;
-		let ln = fresh ctx "t" in
-		emit ctx (Printf.sprintf "%s = call @sa_env_buffer_len(%s)" ln h);
-		track ctx ln;
-		emit ctx (Printf.sprintf "store %s+0, %s as ptr" ps d);
-		emit ctx (Printf.sprintf "call @sa_print_bytes(&%s, %s)" ps ln);
-		let f = fresh ctx "t" in
-		emit ctx (Printf.sprintf "%s = call @sa_env_buffer_free(^%s)" f h);
-		track ctx f;
-		forget ctx h;
-		release_now ctx is0;
-		release_now ctx d;
-		release_now ctx ln;
-		release_now ctx f;
-		emit ctx (Printf.sprintf "jmp %s" l_end);
-		emit_label ctx l_end;
-		true
+		trace_handle_string ctx h
+			"sa_env_buffer_data" "sa_env_buffer_len" "sa_env_buffer_free"
+			"haxe:env-missing"
 	| None -> false
 
+(** Trace `Sys.getCwd()` directly. *)
+let trace_sys_getcwd ctx =
+	let h = fresh ctx "h" in
+	emit ctx (Printf.sprintf "%s = call @sa_env_current_dir()" h);
+	track ctx h;
+	trace_handle_string ctx h
+		"sa_env_buffer_data" "sa_env_buffer_len" "sa_env_buffer_free"
+		"haxe:cwd-missing"
+
+(** `Sys.putEnv(k, v)` statement. Status ignored like saveContent. *)
+let sys_putenv ctx k v =
+	match string_operands ctx k, string_operands ctx v with
+	| Some (kp, kl), Some (vp, vl) ->
+		let st = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = call @sa_env_set_var(%s, %s, %s, %s)"
+			st kp kl vp vl);
+		track ctx st;
+		release_now ctx st;
+		true
+	| _ ->
+		comment ctx "SA-TODO(v0.17): putEnv needs resolvable strings";
+		false
+
+(** `Sys.time()` operand: unix_ms to Float seconds. *)
+let sys_time_op ctx =
+	let m = fresh ctx "t" in
+	emit ctx (Printf.sprintf "%s = call @sa_time_unix_ms()" m);
+	track ctx m;
+	let f = fresh ctx "t" in
+	emit ctx (Printf.sprintf "%s = sitofp %s" f m);
+	track ctx f;
+	let s = fresh ctx "t" in
+	emit ctx (Printf.sprintf "%s = fdiv %s, 1000.0" s f);
+	track ctx s;
+	Reg s
 let rec gen_operand ctx e =
 	match e.eexpr with
 	| TConst (TInt i) -> Imm (Int32.to_string i)
@@ -923,6 +965,9 @@ let rec gen_operand ctx e =
 	| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, [arg])
 		when s_type_path c.cl_path = "Std" && cf.cf_name = "int" ->
 		gen_std_int ctx arg
+	| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, _)
+		when s_type_path c.cl_path = "Sys" && cf.cf_name = "time" ->
+		sys_time_op ctx
 	| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, args) ->
 		(match sys_surface_operand ctx c cf args with
 		| Some o -> o
@@ -1267,15 +1312,48 @@ and materialize_owned ctx e : (string * operand) option =
 	| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, [arg])
 		when s_type_path c.cl_path = "Std" && cf.cf_name = "string" ->
 		materialize_fmt ctx arg
+	| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, n :: _)
+		when s_type_path c.cl_path = "Sys" && cf.cf_name = "getEnv" ->
+		materialize_env_get ctx n
+	| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, _)
+		when s_type_path c.cl_path = "Sys" && cf.cf_name = "getCwd" ->
+		materialize_cwd ctx
 	| TBinop (OpAdd, l, r) when is_string_t e.etype ->
 		materialize_concat_owned ctx l r
 	| TParenthesis e1 | TMeta (_, e1) | TCast (e1, _) ->
 		materialize_owned ctx e1
 	| _ -> None
 
+(** Owned copy of `Sys.getEnv` / `Sys.getCwd` (miss panics, like trace). *)
+and materialize_env_get ctx n =
+	match string_operands ctx n with
+	| Some (kp, kl) ->
+		let h = fresh ctx "h" in
+		emit ctx (Printf.sprintf "%s = call @sa_env_get(%s, %s)" h kp kl);
+		track ctx h;
+		let is0 = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = eq %s, 0" is0 h);
+		track ctx is0;
+		let l_miss = fresh_label ctx "EMISS" in
+		let l_hit = fresh_label ctx "EHIT" in
+		emit ctx (Printf.sprintf "br %s -> %s, %s" is0 l_miss l_hit);
+		emit_label ctx l_miss;
+		emit ctx "panic(\"haxe:env-missing\")";
+		emit_label ctx l_hit;
+		release_now ctx is0;
+		Some (owned_of_handle ctx h
+			"sa_env_buffer_data" "sa_env_buffer_len" "sa_env_buffer_free")
+	| None -> None
+
+and materialize_cwd ctx =
+	let h = fresh ctx "h" in
+	emit ctx (Printf.sprintf "%s = call @sa_env_current_dir()" h);
+	track ctx h;
+	Some (owned_of_handle ctx h
+		"sa_env_buffer_data" "sa_env_buffer_len" "sa_env_buffer_free")
+
 (** Owned copy of a registry handle (fmt/concat/env/fs): data/len out,
-	bytes copied to fresh heap, handle freed. Returns (own, Reg len). *)
-and owned_of_handle ctx h data_fn len_fn free_fn =
+	bytes copied to fresh heap, handle freed. Returns (own, Reg len). *)and owned_of_handle ctx h data_fn len_fn free_fn =
 	let d = fresh ctx "t" in
 	emit ctx (Printf.sprintf "%s = call @%s(%s)" d data_fn h);
 	track ctx d;
@@ -1496,6 +1574,23 @@ and trace_concat ctx l r =
 		if !cur = "" then false else trace_buffered ctx !cur
 	end
 
+and sys_sleep ctx s =
+	let vs = match gen_operand ctx s with
+		| Imm x -> x | Reg r -> r in
+	let ms = fresh ctx "t" in
+	emit ctx (Printf.sprintf "%s = fmul %s, 1000.0" ms vs);
+	track ctx ms;
+	let mi = fresh ctx "t" in
+	emit ctx (Printf.sprintf "%s = fptosi %s" mi ms);
+	track ctx mi;
+	let st = fresh ctx "t" in
+	emit ctx (Printf.sprintf "%s = call @sa_time_sleep_ms(%s)" st mi);
+	track ctx st;
+	release_now ctx ms;
+	release_now ctx mi;
+	release_now ctx st;
+	true
+
 and gen_trace ctx args =
 	if gen_trace_lit ctx args then ()
 	else match args with
@@ -1510,6 +1605,9 @@ and gen_trace ctx args =
 				when s_type_path c.cl_path = "Sys" && cf.cf_name = "getEnv" ->
 				if trace_sys_getenv ctx n then () else
 					comment ctx "SA-TODO(v0.11): getEnv needs resolvable name"
+			| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, _)
+				when s_type_path c.cl_path = "Sys" && cf.cf_name = "getCwd" ->
+				ignore (trace_sys_getcwd ctx)
 			| _ ->
 				comment ctx "SA-TODO(v0.6): trace needs printable value"
 		end
@@ -1855,7 +1953,12 @@ and gen_stmt ctx e =
 		false
 	| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, args) ->
 		if sys_surface_stmt ctx c cf args then false
-		else (ignore (gen_call ctx c cf args); false)
+		else (match s_type_path c.cl_path, cf.cf_name, args with
+		| "Sys", "putEnv", [k; v] ->
+			ignore (sys_putenv ctx k v); false
+		| "Sys", "sleep", [s] ->
+			ignore (sys_sleep ctx s); false
+		| _ -> ignore (gen_call ctx c cf args); false)
 	| TCall ({ eexpr = TField (obj, FInstance (c, _, cf)) }, args) ->
 		ignore (gen_method_call ctx c cf obj args);
 		false
@@ -2260,6 +2363,8 @@ let generate com =
 		output_string ch "@import \"sa_std/string.sa\"\n";
 	if buf_has body "sa_fmt_" || buf_has funcs "sa_fmt_" then
 		output_string ch "@import \"sa_std/fmt.sai\"\n";
+	if buf_has body "sa_time_" || buf_has funcs "sa_time_" then
+		output_string ch "@import \"sa_std/time.sai\"\n";
 	if buf_has body "FS_" || buf_has funcs "FS_"
 	|| buf_has body "sa_fs_" || buf_has funcs "sa_fs_" then
 		output_string ch "@import \"sa_std/fs.sa\"\n";

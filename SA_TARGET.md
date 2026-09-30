@@ -179,4 +179,7 @@ struct 20%, array 10%)。按用户指令：基础特性优先，其次 hxml，�
 - v0.16: `throw`→`panic` (中止等价，载荷注明丢弃) +
   无中止源 try 体直降 (handler 注明省略，有中止源诚实回退)；
   fixture TryHx；18 fixture 全绿。
+- v0.17: `Sys` 纵深 (`putEnv`/`sleep`/`getCwd` 可存 `getEnv`，
+  `time()` 经 `unix_ms`→`sitofp`→`fdiv`，`time.sai` 条件导入)；
+  fixture SysHx；19 fixture 全绿。
 - 每个版本独立提交并推送，`sa_std` 缺失先补 `sci/sa_std`。
