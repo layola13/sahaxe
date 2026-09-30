@@ -136,7 +136,15 @@ struct 20%, array 10%)。按用户指令：基础特性优先，其次 hxml，�
   (全标量签名，参数栈驻留，递归/前向调用预注册)；
   调用 `r = call` / void 裸 `call`；函数尾声按终结标志取舍
   (无不可达)；fixture Funcs (add/fact 递归) 零 TODO。
-- v0.6a (本提交): 字符串 `==`/`!=` + switch-on-string，
+- v0.6a: 字符串 `==`/`!=` + switch-on-string，
+  消费补充的 `STRING_EQ`/`STRING_NEQ` (长度前端跟踪，
+  条件 `@import "sa_std/string.sa")；单测试寄存器复用；
+  存活表路径纪律 (save/restore/keep_oldest)，Referee 全绿
+  (8 fixtures 零 TODO + `sa check` 零 trap)。
+- v0.6b (本提交): `Std.string(int)` + 字符串 `+` 直接打印
+  (fmt/concat 句柄经共享注册表 data/len/free，全既有契约；
+  借用 `&pslot` 满足 print 合约；左折叠多段拼接)；
+  typedef 转写透明；fixture StrFmt；9 fixture Referee 全绿。
   消费补充的 `STRING_EQ`/`STRING_NEQ` (长度前端跟踪，
   条件 `@import "sa_std/string.sa")；单测试寄存器复用；
   存活表路径纪律 (save/restore/keep_oldest)，Referee 全绿

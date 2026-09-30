@@ -56,65 +56,66 @@
 
 @main() -> i32:
 L_ENTRY:
-    var0 = stack_alloc 8
+    pslot0 = stack_alloc 8
     var1 = stack_alloc 8
     var2 = stack_alloc 8
-    arr3 = alloc 40
-    store arr3+0, 4 as u64
-    store arr3+8, 1 as i32
-    store arr3+16, 2 as i32
-    store arr3+24, 3 as i32
-    store arr3+32, 4 as i32
-    store var0+0, arr3 as ptr
-    store var1+0, 0 as i32
+    var3 = stack_alloc 8
+    arr4 = alloc 40
+    store arr4+0, 4 as u64
+    store arr4+8, 1 as i32
+    store arr4+16, 2 as i32
+    store arr4+24, 3 as i32
+    store arr4+32, 4 as i32
+    store var1+0, arr4 as ptr
     store var2+0, 0 as i32
+    store var3+0, 0 as i32
     jmp L_COND0
 L_COND0:
-    t4 = load var2+0 as i32
-    t5 = load var0+0 as ptr
-    t6 = load t5+0 as u64
-    t7 = slt t4, t6
-    br t7 -> L_BODY1, L_ENDWHILE2
+    t5 = load var3+0 as i32
+    t6 = load var1+0 as ptr
+    t7 = load t6+0 as u64
+    t8 = slt t5, t7
+    br t8 -> L_BODY1, L_ENDWHILE2
 L_BODY1:
-    t8 = load var1+0 as i32
-    t9 = load var0+0 as ptr
-    t10 = load var2+0 as i32
-    off11 = mul t10, 8
-    ep12 = ptr_add t9, off11
-    t13 = load ep12+0 as i32
-    t14 = add t8, t13
-    store var1+0, t14 as i32
-    t15 = load var2+0 as i32
-    t16 = add t15, 1
-    store var2+0, t16 as i32
-    !t4
+    t9 = load var2+0 as i32
+    t10 = load var1+0 as ptr
+    t11 = load var3+0 as i32
+    off12 = mul t11, 8
+    ep13 = ptr_add t10, off12
+    t14 = load ep13+0 as i32
+    t15 = add t9, t14
+    store var2+0, t15 as i32
+    t16 = load var3+0 as i32
+    t17 = add t16, 1
+    store var3+0, t17 as i32
     !t5
     !t6
     !t7
     !t8
     !t9
     !t10
-    !off11
-    !ep12
-    !t13
+    !t11
+    !off12
+    !ep13
     !t14
     !t15
     !t16
+    !t17
     jmp L_COND0
 L_ENDWHILE2:
-    t17 = load var0+0 as ptr
-    off18 = mul 0, 8
-    ep19 = ptr_add t17, off18
-    t20 = load var1+0 as i32
-    store ep19+0, t20 as i32
+    t18 = load var1+0 as ptr
+    off19 = mul 0, 8
+    ep20 = ptr_add t18, off19
+    t21 = load var2+0 as i32
+    store ep20+0, t21 as i32
     call @sa_print_bytes(&STR_0, 8)
-    !arr3
-    !t4
+    !arr4
     !t5
     !t6
     !t7
-    !t17
-    !off18
-    !ep19
-    !t20
+    !t8
+    !t18
+    !off19
+    !ep20
+    !t21
     return 0

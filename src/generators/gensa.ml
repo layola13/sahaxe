@@ -75,6 +75,10 @@ type ctx = {
 		string-typed locals are tracked here (v_id -> Imm length or
 		Reg holding it). Unknown = absent. *)
 	str_lens : (int, operand) Hashtbl.t;
+	(** Scratch stack slot for buffered print data (created at entry,
+		so no branch-local alloc). Passed as `&pslot` to satisfy the
+		borrow contract of `sa_print_bytes`. *)
+	mutable pslot : string option;
 }
 
 let fresh ctx prefix =
@@ -104,6 +108,16 @@ let emit_label ctx l =
 
 let track ctx r =
 	ctx.live <- r :: ctx.live
+
+(** Forget a register without emitting (paired with an explicit release
+	emitted by the caller). *)
+let forget ctx r =
+	ctx.live <- List.filter (fun x -> x <> r) ctx.live
+
+(** Immediate post-use cleanup: emit `!r` and drop bookkeeping. *)
+let release_now ctx r =
+	emit ctx ("!" ^ r);
+	forget ctx r
 
 (** Path-discipline helpers: sibling branch paths are generated
 	sequentially but execute exclusively. Each arm must start from the
@@ -153,8 +167,6 @@ let sa_escape s =
 	) s;
 	Buffer.contents b
 
-(** Materialize a string literal as `@const STR_n = utf8:"..."` and
-	return its name. Byte length = OCaml String.length (UTF-8 bytes). *)
 let intern_string ctx s =
 	let id = ctx.next_str in
 	ctx.next_str <- id + 1;
@@ -262,8 +274,19 @@ let new_fun_ctx com header emitted funcs = {
 	next_reg = 0; next_str = 0; next_label = 0;
 	vars = Hashtbl.create 16; live = []; loops = [];
 	emitted; funcs;
-	str_lens = Hashtbl.create 8;
+	str_lens = Hashtbl.create 8; pslot = None;
 }
+
+(** Lazily create the entry scratch slot for buffered prints. Must be
+	called at function entry (before any branch). *)
+let ensure_pslot ctx =
+	match ctx.pslot with
+	| Some s -> s
+	| None ->
+		let s = fresh ctx "pslot" in
+		emit ctx (Printf.sprintf "%s = stack_alloc 8" s);
+		ctx.pslot <- Some s;
+		s
 
 (** Null test (a `null` side of `==` compares pointers, correctly). *)
 let rec is_null_expr e =
@@ -290,13 +313,13 @@ let callee_kind e =
 	| TConst _ -> "Const"
 	| _ -> "Other"
 
-let gen_trace ctx args =
+let gen_trace_lit ctx args =
 	match args with
 	| { eexpr = TConst (TString s) } :: _ ->
 		let (name, len) = intern_string ctx s in
-		emit ctx (Printf.sprintf "call @sa_print_bytes(&%s, %d)" name len)
-	| _ ->
-		comment ctx "SA-TODO(v0.2): trace of non-literal (needs fmt buffer)"
+		emit ctx (Printf.sprintf "call @sa_print_bytes(&%s, %d)" name len);
+		true
+	| _ -> false
 
 
 let release_all_except ctx keep =
@@ -651,6 +674,114 @@ and gen_string_eq ctx op e1 e2 =
 	| _ ->
 		comment ctx "SA-TODO(v0.6): string compare needs tracked lengths";
 		Imm "0"
+
+(** Print a computed string directly without storing it.
+	`Std.string(int)` flows through `sa_fmt_i64`, `a + b` through
+	`sa_string_concat`; both return registry handles read via the
+	shared `sa_fmt_buffer_*` triple and freed inline, so no new ABI.
+	Concat sides must resolve via string_operands (literals/tracked
+	vars); stored computed strings stay a TODO. Returns true when
+	emitted. *)
+and trace_string_value ctx e : bool =
+	match e.eexpr with
+	| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, [arg])
+		when s_type_path c.cl_path = "Std" && cf.cf_name = "string" ->
+		trace_fmt_int ctx arg
+	| TBinop (OpAdd, l, r) when is_string_t e.etype ->
+		trace_concat ctx l r
+	| TParenthesis e1 | TMeta (_, e1) | TCast (e1, _) -> trace_string_value ctx e1
+	| _ -> match string_operands ctx e with
+		| Some (p, l) ->
+			emit ctx (Printf.sprintf "call @sa_print_bytes(%s, %s)" p l);
+			true
+		| None -> false
+
+and trace_buffered ctx h =
+	let ps = match ctx.pslot with Some s -> s | None -> ensure_pslot ctx in
+	let d = fresh ctx "t" in
+	emit ctx (Printf.sprintf "%s = call @sa_fmt_buffer_data(%s)" d h);
+	track ctx d;
+	let l = fresh ctx "t" in
+	emit ctx (Printf.sprintf "%s = call @sa_fmt_buffer_len(%s)" l h);
+	track ctx l;
+	emit ctx (Printf.sprintf "store %s+0, %s as ptr" ps d);
+	emit ctx (Printf.sprintf "call @sa_print_bytes(&%s, %s)" ps l);
+	let f = fresh ctx "t" in
+	emit ctx (Printf.sprintf "%s = call @sa_fmt_buffer_free(^%s)" f h);
+	track ctx f;
+	forget ctx h;
+	release_now ctx d;
+	release_now ctx l;
+	release_now ctx f;
+	true
+
+and trace_fmt_int ctx arg =
+	match follow arg.etype with
+	| TAbstract ({ a_path = ([], "Int") }, _) ->
+		let vs = match gen_operand ctx arg with
+			| Imm s -> s | Reg r -> r in
+		let h = fresh ctx "h" in
+		emit ctx (Printf.sprintf "%s = call @sa_fmt_i64(%s, 10)" h vs);
+		track ctx h;
+		trace_buffered ctx h
+	| _ ->
+		comment ctx "SA-TODO(v0.6): Std.string(non-int)";
+		false
+
+and trace_concat ctx l r =
+	let rec flatten acc e = match e.eexpr with
+		| TBinop (OpAdd, a, b) when is_string_t e.etype ->
+			flatten (flatten acc a) b
+		| TParenthesis e1 | TMeta (_, e1) | TCast (e1, _) -> flatten acc e1
+		| _ -> acc @ [e] in
+	let parts = flatten (flatten [] l) r in
+	let resolved = List.map (string_operands ctx) parts in
+	if List.length parts < 2 || List.exists ((=) None) resolved then begin
+		comment ctx "SA-TODO(v0.6): concat needs resolvable sides";
+		false
+	end else begin
+		let pairs = List.map (function Some x -> x | None -> ("", "")) resolved in
+		let cur = ref "" in
+		let do_concat h pa la pb lb =
+			emit ctx (Printf.sprintf "%s = call @sa_string_concat(%s, %s, %s, %s)"
+				h pa la pb lb) in
+		(match pairs with
+		| (p0, l0) :: (p1, l1) :: rest ->
+			let h0 = fresh ctx "h" in
+			track ctx h0;
+			do_concat h0 p0 l0 p1 l1;
+			cur := h0;
+			List.iter (fun (pn, ln) ->
+				let d = fresh ctx "t" in
+				emit ctx (Printf.sprintf "%s = call @sa_fmt_buffer_data(%s)" d !cur);
+				track ctx d;
+				let ln2 = fresh ctx "t" in
+				emit ctx (Printf.sprintf "%s = call @sa_fmt_buffer_len(%s)" ln2 !cur);
+				track ctx ln2;
+				let h2 = fresh ctx "h" in
+				emit ctx (Printf.sprintf "%s = call @sa_string_concat(%s, %s, %s, %s)"
+					h2 d ln2 pn ln);
+				track ctx h2;
+				let f = fresh ctx "t" in
+				emit ctx (Printf.sprintf "%s = call @sa_fmt_buffer_free(^%s)" f !cur);
+				track ctx f;
+				release_now ctx d;
+				release_now ctx ln2;
+				release_now ctx f;
+				forget ctx !cur;
+				cur := h2
+			) rest
+		| _ -> ());
+		if !cur = "" then false else trace_buffered ctx !cur
+	end
+
+and gen_trace ctx args =
+	if gen_trace_lit ctx args then ()
+	else match args with
+	| a :: _ ->
+		if trace_string_value ctx a then () else
+			comment ctx "SA-TODO(v0.6): trace needs printable value"
+	| [] -> ()
 
 and entry_stmts e =
 	match e.eexpr with
@@ -1074,6 +1205,7 @@ and gen_stmt ctx e =
 		false
 
 and gen_function fctx name tf ptys ret body_stmts =
+	ignore (ensure_pslot fctx);
 	let fvars = List.combine (List.map fst tf.tf_args) ptys in
 	List.iter (fun (v, ty) ->
 		let slot = fresh fctx "var" in
@@ -1170,7 +1302,7 @@ let generate com =
 		next_reg = 0; next_str = 0; next_label = 0;
 		vars = Hashtbl.create 16; live = []; loops = [];
 		emitted; funcs;
-		str_lens = Hashtbl.create 8;
+		str_lens = Hashtbl.create 8; pslot = None;
 	} in
 	List.iter (print_type types) com.types;
 	let (stmts, has_args, main_class) = match com.main.main_expr with
@@ -1179,6 +1311,7 @@ let generate com =
 	in
 	if has_args then comment ctx "SA-TODO(v0.4): entry with args";
 	if stmts = [] then comment ctx "no haxe main entry";
+	ignore (ensure_pslot ctx);
 	(* Pre-register emittable helpers of the main class so calls
 		(including recursion and forward calls) resolve. *)
 	let helpers = match main_class with
@@ -1220,8 +1353,11 @@ let generate com =
 	output_string ch "// Generated by the Haxe SA target v0.5.\n";
 	output_string ch "// + static helpers and calls; see SA_TARGET.md.\n";
 	output_string ch "@import \"sa_std/io/print.sai\"\n";
-	if buf_has body "STRING_EQ" || buf_has funcs "STRING_EQ" then
+	if buf_has body "STRING_EQ" || buf_has funcs "STRING_EQ"
+	|| buf_has body "sa_string_concat" || buf_has funcs "sa_string_concat" then
 		output_string ch "@import \"sa_std/string.sa\"\n";
+	if buf_has body "sa_fmt_" || buf_has funcs "sa_fmt_" then
+		output_string ch "@import \"sa_std/fmt.sai\"\n";
 	output_string ch "\n";
 	output_string ch (Buffer.contents header);
 	output_string ch "\n";

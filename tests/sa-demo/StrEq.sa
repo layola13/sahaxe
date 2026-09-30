@@ -70,18 +70,19 @@
 
 @main() -> i32:
 L_ENTRY:
-    var0 = stack_alloc 8
+    pslot0 = stack_alloc 8
     var1 = stack_alloc 8
     var2 = stack_alloc 8
     var3 = stack_alloc 8
     var4 = stack_alloc 8
-    store var0+0, &STR_0 as ptr
-    store var1+0, &STR_1 as ptr
-    store var2+0, &STR_2 as ptr
-    t5 = load var0+0 as ptr
+    var5 = stack_alloc 8
+    store var1+0, &STR_0 as ptr
+    store var2+0, &STR_1 as ptr
+    store var3+0, &STR_2 as ptr
     t6 = load var1+0 as ptr
-    EXPAND STRING_EQ t7, t5, 5, t6, 5
-    br t7 -> L_THEN0, L_ELSE2
+    t7 = load var2+0 as ptr
+    EXPAND STRING_EQ t8, t6, 5, t7, 5
+    br t8 -> L_THEN0, L_ELSE2
 L_THEN0:
     call @sa_print_bytes(&STR_3, 5)
     jmp L_ENDIF1
@@ -89,10 +90,10 @@ L_ELSE2:
     call @sa_print_bytes(&STR_4, 6)
     jmp L_ENDIF1
 L_ENDIF1:
-    t8 = load var0+0 as ptr
-    t9 = load var2+0 as ptr
-    EXPAND STRING_NEQ t10, t8, 5, t9, 5
-    br t10 -> L_THEN3, L_ELSE5
+    t9 = load var1+0 as ptr
+    t10 = load var3+0 as ptr
+    EXPAND STRING_NEQ t11, t9, 5, t10, 5
+    br t11 -> L_THEN3, L_ELSE5
 L_THEN3:
     call @sa_print_bytes(&STR_5, 6)
     jmp L_ENDIF4
@@ -100,41 +101,41 @@ L_ELSE5:
     call @sa_print_bytes(&STR_6, 7)
     jmp L_ENDIF4
 L_ENDIF4:
-    store var3+0, &STR_7 as ptr
-    t11 = load var3+0 as ptr
-    store var4+0, t11 as ptr
+    store var4+0, &STR_7 as ptr
     t12 = load var4+0 as ptr
-    EXPAND STRING_EQ swt13, t12, 3, &STR_8, 4
-    br swt13 -> L_ARM8_0, L_SWOR10
+    store var5+0, t12 as ptr
+    t13 = load var5+0 as ptr
+    EXPAND STRING_EQ swt14, t13, 3, &STR_8, 4
+    br swt14 -> L_ARM8_0, L_SWOR10
 L_SWOR10:
-    !swt13
-    EXPAND STRING_EQ swt13, t12, 3, &STR_9, 5
-    br swt13 -> L_ARM8_0, L_SWNEXT9
+    !swt14
+    EXPAND STRING_EQ swt14, t13, 3, &STR_9, 5
+    br swt14 -> L_ARM8_0, L_SWNEXT9
 L_SWNEXT9:
-    !swt13
-    EXPAND STRING_EQ swt13, t12, 3, &STR_10, 3
-    br swt13 -> L_ARM8_1, L_SWDEF7
+    !swt14
+    EXPAND STRING_EQ swt14, t13, 3, &STR_10, 3
+    br swt14 -> L_ARM8_1, L_SWDEF7
 L_ARM8_0:
     call @sa_print_bytes(&STR_11, 7)
-    !t12
-    !swt13
+    !t13
+    !swt14
     jmp L_ENDSWITCH6
 L_ARM8_1:
     call @sa_print_bytes(&STR_12, 6)
-    !t12
-    !swt13
+    !t13
+    !swt14
     jmp L_ENDSWITCH6
 L_SWDEF7:
     call @sa_print_bytes(&STR_13, 5)
-    !t12
-    !swt13
+    !t13
+    !swt14
     jmp L_ENDSWITCH6
 L_ENDSWITCH6:
-    !t5
     !t6
     !t7
     !t8
     !t9
     !t10
     !t11
+    !t12
     return 0

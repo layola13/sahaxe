@@ -58,55 +58,55 @@
 
 @main() -> i32:
 L_ENTRY:
-    var0 = stack_alloc 8
+    pslot0 = stack_alloc 8
     var1 = stack_alloc 8
     var2 = stack_alloc 8
     var3 = stack_alloc 8
     var4 = stack_alloc 8
     var5 = stack_alloc 8
-    arr6 = alloc 24
-    store arr6+0, 2 as u64
-    obj7 = alloc 16
-    store obj7+0, 1 as i32
-    store obj7+8, 2 as i32
-    store arr6+8, obj7 as ptr
+    var6 = stack_alloc 8
+    arr7 = alloc 24
+    store arr7+0, 2 as u64
     obj8 = alloc 16
-    store obj8+0, 10 as i32
-    store obj8+8, 20 as i32
-    store arr6+16, obj8 as ptr
-    store var0+0, arr6 as ptr
-    store var1+0, 0 as i32
+    store obj8+0, 1 as i32
+    store obj8+8, 2 as i32
+    store arr7+8, obj8 as ptr
+    obj9 = alloc 16
+    store obj9+0, 10 as i32
+    store obj9+8, 20 as i32
+    store arr7+16, obj9 as ptr
+    store var1+0, arr7 as ptr
     store var2+0, 0 as i32
+    store var3+0, 0 as i32
     jmp L_COND0
 L_COND0:
-    t9 = load var1+0 as i32
-    t10 = slt t9, 2
-    br t10 -> L_BODY1, L_ENDWHILE2
+    t10 = load var2+0 as i32
+    t11 = slt t10, 2
+    br t11 -> L_BODY1, L_ENDWHILE2
 L_BODY1:
-    t11 = load var0+0 as ptr
-    t12 = load var1+0 as i32
-    off13 = mul t12, 8
-    ep14 = ptr_add t11, off13
-    t15 = load ep14+0 as ptr
-    store var3+0, t15 as ptr
-    t16 = load var2+0 as i32
-    t17 = load var3+0 as ptr
-    t18 = load t17+0 as i32
-    t19 = add t16, t18
-    t20 = load var3+0 as ptr
-    t21 = load t20+8 as i32
-    t22 = add t19, t21
-    store var2+0, t22 as i32
-    t23 = load var1+0 as i32
-    t24 = add t23, 1
-    store var1+0, t24 as i32
-    !t9
+    t12 = load var1+0 as ptr
+    t13 = load var2+0 as i32
+    off14 = mul t13, 8
+    ep15 = ptr_add t12, off14
+    t16 = load ep15+0 as ptr
+    store var4+0, t16 as ptr
+    t17 = load var3+0 as i32
+    t18 = load var4+0 as ptr
+    t19 = load t18+0 as i32
+    t20 = add t17, t19
+    t21 = load var4+0 as ptr
+    t22 = load t21+8 as i32
+    t23 = add t20, t22
+    store var3+0, t23 as i32
+    t24 = load var2+0 as i32
+    t25 = add t24, 1
+    store var2+0, t25 as i32
     !t10
     !t11
     !t12
-    !off13
-    !ep14
-    !t15
+    !t13
+    !off14
+    !ep15
     !t16
     !t17
     !t18
@@ -116,17 +116,18 @@ L_BODY1:
     !t22
     !t23
     !t24
+    !t25
     jmp L_COND0
 L_ENDWHILE2:
-    store var4+0, 5 as i32
-    store var5+0, 6 as i32
-    t25 = load var4+0 as i32
-    t26 = load var2+0 as i32
-    t27 = add t25, t26
-    store var4+0, t27 as i32
-    t28 = load var4+0 as i32
-    t29 = eq t28, 38
-    br t29 -> L_THEN3, L_ELSE5
+    store var5+0, 5 as i32
+    store var6+0, 6 as i32
+    t26 = load var5+0 as i32
+    t27 = load var3+0 as i32
+    t28 = add t26, t27
+    store var5+0, t28 as i32
+    t29 = load var5+0 as i32
+    t30 = eq t29, 38
+    br t30 -> L_THEN3, L_ELSE5
 L_THEN3:
     call @sa_print_bytes(&STR_0, 9)
     jmp L_ENDIF4
@@ -134,14 +135,14 @@ L_ELSE5:
     call @sa_print_bytes(&STR_1, 10)
     jmp L_ENDIF4
 L_ENDIF4:
-    !arr6
-    !obj7
+    !arr7
     !obj8
-    !t9
+    !obj9
     !t10
-    !t25
+    !t11
     !t26
     !t27
     !t28
     !t29
+    !t30
     return 0

@@ -59,15 +59,16 @@
 
 @main() -> i32:
 L_ENTRY:
-    var0 = stack_alloc 8
+    pslot0 = stack_alloc 8
     var1 = stack_alloc 8
-    t2 = call @hx_Funcs_add(20, 22)
-    store var0+0, t2 as i32
-    t3 = call @hx_Funcs_fact(5)
+    var2 = stack_alloc 8
+    t3 = call @hx_Funcs_add(20, 22)
     store var1+0, t3 as i32
-    t4 = load var0+0 as i32
-    t5 = eq t4, 42
-    br t5 -> L_THEN0, L_ELSE2
+    t4 = call @hx_Funcs_fact(5)
+    store var2+0, t4 as i32
+    t5 = load var1+0 as i32
+    t6 = eq t5, 42
+    br t6 -> L_THEN0, L_ELSE2
 L_THEN0:
     call @sa_print_bytes(&STR_0, 6)
     jmp L_ENDIF1
@@ -75,9 +76,9 @@ L_ELSE2:
     call @sa_print_bytes(&STR_1, 7)
     jmp L_ENDIF1
 L_ENDIF1:
-    t6 = load var1+0 as i32
-    t7 = eq t6, 120
-    br t7 -> L_THEN3, L_ELSE5
+    t7 = load var2+0 as i32
+    t8 = eq t7, 120
+    br t8 -> L_THEN3, L_ELSE5
 L_THEN3:
     call @sa_print_bytes(&STR_2, 7)
     jmp L_ENDIF4
@@ -85,52 +86,54 @@ L_ELSE5:
     call @sa_print_bytes(&STR_3, 8)
     jmp L_ENDIF4
 L_ENDIF4:
+    !t3
+    !t4
+    !t5
+    !t6
+    !t7
+    !t8
+    return 0
+
+@hx_Funcs_add(a: i32, b: i32) -> i32:
+L_ENTRY:
+    pslot0 = stack_alloc 8
+    var1 = stack_alloc 8
+    store var1+0, a as i32
+    var2 = stack_alloc 8
+    store var2+0, b as i32
+    t3 = load var1+0 as i32
+    t4 = load var2+0 as i32
+    t5 = add t3, t4
+    !a
+    !b
+    !t3
+    !t4
+    return t5
+
+@hx_Funcs_fact(n: i32) -> i32:
+L_ENTRY:
+    pslot0 = stack_alloc 8
+    var1 = stack_alloc 8
+    store var1+0, n as i32
+    t2 = load var1+0 as i32
+    t3 = sle t2, 1
+    br t3 -> L_THEN0, L_ENDIF1
+L_THEN0:
+    !n
+    !t2
+    !t3
+    return 1
+L_ENDIF1:
+    t4 = load var1+0 as i32
+    t5 = load var1+0 as i32
+    t6 = sub t5, 1
+    t7 = call @hx_Funcs_fact(t6)
+    t8 = mul t4, t7
+    !n
     !t2
     !t3
     !t4
     !t5
     !t6
     !t7
-    return 0
-
-@hx_Funcs_add(a: i32, b: i32) -> i32:
-L_ENTRY:
-    var0 = stack_alloc 8
-    store var0+0, a as i32
-    var1 = stack_alloc 8
-    store var1+0, b as i32
-    t2 = load var0+0 as i32
-    t3 = load var1+0 as i32
-    t4 = add t2, t3
-    !a
-    !b
-    !t2
-    !t3
-    return t4
-
-@hx_Funcs_fact(n: i32) -> i32:
-L_ENTRY:
-    var0 = stack_alloc 8
-    store var0+0, n as i32
-    t1 = load var0+0 as i32
-    t2 = sle t1, 1
-    br t2 -> L_THEN0, L_ENDIF1
-L_THEN0:
-    !n
-    !t1
-    !t2
-    return 1
-L_ENDIF1:
-    t3 = load var0+0 as i32
-    t4 = load var0+0 as i32
-    t5 = sub t4, 1
-    t6 = call @hx_Funcs_fact(t5)
-    t7 = mul t3, t6
-    !n
-    !t1
-    !t2
-    !t3
-    !t4
-    !t5
-    !t6
-    return t7
+    return t8

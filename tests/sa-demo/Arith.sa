@@ -56,25 +56,26 @@
 
 @main() -> i32:
 L_ENTRY:
-    var0 = stack_alloc 8
+    pslot0 = stack_alloc 8
     var1 = stack_alloc 8
     var2 = stack_alloc 8
     var3 = stack_alloc 8
-    store var0+0, 6 as i32
-    store var1+0, 7 as i32
-    t4 = load var0+0 as i32
+    var4 = stack_alloc 8
+    store var1+0, 6 as i32
+    store var2+0, 7 as i32
     t5 = load var1+0 as i32
-    t6 = mul t4, t5
-    t7 = add t6, 1
-    store var2+0, t7 as i32
-    t8 = load var2+0 as i32
-    t9 = eq t8, 43
-    store var3+0, t9 as i32
+    t6 = load var2+0 as i32
+    t7 = mul t5, t6
+    t8 = add t7, 1
+    store var3+0, t8 as i32
+    t9 = load var3+0 as i32
+    t10 = eq t9, 43
+    store var4+0, t10 as i32
     call @sa_print_bytes(&STR_0, 4)
-    !t4
     !t5
     !t6
     !t7
     !t8
     !t9
+    !t10
     return 0
