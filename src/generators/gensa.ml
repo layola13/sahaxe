@@ -265,18 +265,27 @@ let sa_fun_name c cf =
 let sa_ctor_name c =
 	"hx_" ^ String.concat "_" (fst c.cl_path @ [snd c.cl_path]) ^ "_new"
 
-(** Scalar return annotation (None = not a plain scalar signature). *)
+(** Scalar return annotation (None = not a plain scalar signature).
+	Enums pass as opaque object pointers. *)
 let scalar_ret t =
 	match follow t with
 	| TAbstract ({ a_path = ([], "Int") }, _)
 	| TAbstract ({ a_path = ([], "Bool") }, _) -> Some "i32"
 	| TAbstract ({ a_path = ([], "Float") }, _) -> Some "f64"
 	| TAbstract ({ a_path = ([], "Void") }, _) -> Some "void"
+	| TEnum _ -> Some "ptr"
 	| _ -> None
 
 let scalar_param t = match scalar_ret t with
 	| Some "void" -> None
 	| x -> x
+
+(** True when the (followed) type is a Haxe enum (passed as an
+	opaque object pointer, like arrays). *)
+let is_enum_t t =
+	match follow t with
+	| TEnum _ -> true
+	| _ -> false
 
 (** Expanded parameter: scalars pass by value, strings as
 	`(name_ptr: ptr, name_len: u64)` borrow pairs. *)
@@ -963,6 +972,9 @@ let rec gen_operand ctx e =
 		gen_ifield_set ctx obj c cf rhs
 	| TObjectDecl decls -> gen_object_decl ctx decls
 	| TField (obj, FAnon cf) -> gen_field_get ctx obj cf.cf_name
+	| TCall ({ eexpr = TField (_, FEnum (_, ef)) }, args) ->
+		gen_enum_construct ctx ef args
+	| TEnumParameter (e1, ef, index) -> gen_enum_param ctx e1 ef index
 	| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, [arg])
 		when s_type_path c.cl_path = "Std" && cf.cf_name = "int" ->
 		gen_std_int ctx arg
@@ -1234,8 +1246,21 @@ and gen_array_len ctx base =
 		track ctx r;
 		Reg r
 
+(** Bare payload-free enum constructor (tag constant, no heap). *)
+and is_tag_const e =
+	match e.eexpr with
+	| TField (_, FEnum _) -> true
+	| TParenthesis e1 | TMeta (_, e1) | TCast (e1, _) -> is_tag_const e1
+	| _ -> false
+
 and gen_binop ctx op e1 e2 etype =
 	if (op = OpEq || op = OpNotEq)
+		&& (is_enum_t e1.etype || is_enum_t e2.etype)
+		&& not (is_null_expr e1 || is_null_expr e2)
+		&& not (is_tag_const e1 && is_tag_const e2) then begin
+		comment ctx "SA-TODO(v0.19): structural enum equality";
+		Imm "0"
+	end else if (op = OpEq || op = OpNotEq)
 		&& (is_string_t e1.etype || is_string_t e2.etype)
 		&& not (is_null_expr e1 || is_null_expr e2) then
 		gen_string_eq ctx op e1 e2
@@ -1729,6 +1754,63 @@ and cond_reg ctx e =
 		track ctx r;
 		r
 
+(** Payload type of an enum constructor field by index (None when
+	unresolvable — callers fall back honestly instead of guessing). *)
+and enum_payload_ty ef index =
+	match follow ef.ef_type with
+	| TFun (args, _) -> begin
+		try
+			let (_, _, t) = List.nth args index in
+			Some (mem_ty t)
+		with _ -> None
+	end
+	| _ -> None
+
+(** Construct a payload enum value: tagged heap object
+	`[tag:i32][payload0][payload1]...` (8 bytes each). Payload-free
+	uses the existing tag-constant path. *)
+and gen_enum_construct ctx ef args =
+	let tys = List.mapi (fun i _ -> enum_payload_ty ef i) args in
+	if List.exists ((=) None) tys then begin
+		comment ctx "SA-TODO(v0.19): unresolvable payload types";
+		Imm "0"
+	end else begin
+		let n = List.length args in
+		let obj = fresh ctx "obj" in
+		emit ctx (Printf.sprintf "%s = alloc %d" obj ((n + 1) * 8));
+		track ctx obj;
+		emit ctx (Printf.sprintf "store %s+0, %d as i32" obj ef.ef_index);
+		let rec store_each i = function
+			| [], [] -> ()
+			| a :: rest_a, tyo :: rest_t ->
+				let o = gen_operand ctx a in
+				let os = match o with Imm s -> s | Reg r -> r in
+				let ty = match tyo with Some t -> t | None -> "i32" in
+				emit ctx (Printf.sprintf "store %s+%d, %s as %s"
+					obj ((i + 1) * 8) os ty);
+				store_each (i + 1) (rest_a, rest_t)
+			| _ -> () in
+		store_each 0 (args, tys);
+		Reg obj
+	end
+
+(** Extract a payload word: `load obj+(8+i*8)`. *)
+and gen_enum_param ctx e ef index =
+	match gen_operand ctx e with
+	| Imm _ ->
+		comment ctx "SA-TODO(v0.19): enum base must be a register";
+		Imm "0"
+	| Reg b ->
+	(match enum_payload_ty ef index with
+	| None ->
+		comment ctx "SA-TODO(v0.19): unresolvable payload type";
+		Imm "0"
+	| Some ty ->
+		let r = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = load %s+%d as %s" r b ((index + 1) * 8) ty);
+		track ctx r;
+		Reg r)
+
 and gen_switch ctx sw =
 	let all_pats = List.concat (List.map (fun c -> c.case_patterns) sw.switch_cases) in
 	let str_mode = is_string_t sw.switch_subject.etype in
@@ -1896,7 +1978,11 @@ and gen_switch ctx sw =
 			if not term then emit ctx (Printf.sprintf "jmp %s" l_end);
 			all_term := !all_term && term
 		| _ -> ());
-		emit_label ctx l_end;
+		(* A nomatch trampoline always falls through to the merge, so a
+			switch without default never counts as terminated. *)
+		if l_nomatch <> None then all_term := false;
+		if arms = [] && sw.switch_default = None then all_term := false;
+		if not !all_term then emit_label ctx l_end;
 		if arms <> [] || sw.switch_default <> None then
 			restore_live ctx (keep_oldest snap_all saved_full);
 		!all_term
@@ -2003,7 +2089,9 @@ and gen_stmt ctx e =
 			let term_else = gen_stmt ctx else_e in
 			release_since ctx snap;
 			if not term_else then emit ctx (Printf.sprintf "jmp %s" l_end);
-			emit_label ctx l_end;
+			(* Fully terminated: no edge reaches the merge; emitting
+				an empty trailing label trips FallthroughForbidden. *)
+			if not (term_then && term_else) then emit_label ctx l_end;
 			restore_live ctx arm_state;
 			term_then && term_else
 		| None ->
