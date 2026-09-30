@@ -146,6 +146,13 @@ let is_float_t t =
 	| TInst ({ cl_path = ([], "Float") }, _) -> true
 	| _ -> false
 
+(** True when the (followed) type is Haxe Int (needs sitofp in a
+	float context). *)
+let is_int_t t =
+	match follow t with
+	| TAbstract ({ a_path = ([], "Int") }, _) -> true
+	| _ -> false
+
 (** Memory annotation for homed slots: Float -> f64, Int/Bool -> i32,
 	everything else (Array/String/objects) -> ptr. Deterministic per
 	type so matching load/store pairs always agree. *)
@@ -803,9 +810,15 @@ let rec gen_operand ctx e =
 			comment ctx "SA-TODO(v0.9): array assign-op";
 			Imm "0"
 	end
+	| TUnop (Neg, _, e1) when is_float_t e1.etype ->
+		let o = gen_operand ctx e1 in
+		let os = match o with Imm s -> s | Reg r -> r in
+		let r = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = fneg %s" r os);
+		track ctx r;
+		Reg r
 	| TUnop (op, _, { eexpr = TLocal v }) -> begin
-		(* `i++` / `i--` (optimizer also rewrites `i = i + 1`). *)
-		try
+		(* `i++` / `i--` (optimizer also rewrites `i = i + 1`). *)		try
 			let slot = Hashtbl.find ctx.vars v.v_id in
 			let ty = mem_ty v.v_type in
 			let cur = fresh ctx "t" in
@@ -836,6 +849,9 @@ let rec gen_operand ctx e =
 		gen_ifield_set ctx obj c cf rhs
 	| TObjectDecl decls -> gen_object_decl ctx decls
 	| TField (obj, FAnon cf) -> gen_field_get ctx obj cf.cf_name
+	| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, [arg])
+		when s_type_path c.cl_path = "Std" && cf.cf_name = "int" ->
+		gen_std_int ctx arg
 	| TCall ({ eexpr = TField (_, FStatic (c, cf)) }, args) ->
 		(match sys_surface_operand ctx c cf args with
 		| Some o -> o
@@ -1102,6 +1118,9 @@ and gen_binop ctx op e1 e2 etype =
 	let float_mnemonic = match op with
 		| OpAdd -> Some "fadd" | OpSub -> Some "fsub"
 		| OpMult -> Some "fmul" | OpDiv -> Some "fdiv"
+		| OpEq -> Some "fcmp_eq" | OpNotEq -> Some "fcmp_ne"
+		| OpGt -> Some "fcmp_gt" | OpGte -> Some "fcmp_ge"
+		| OpLt -> Some "fcmp_lt" | OpLte -> Some "fcmp_le"
 		| _ -> None
 	in
 	let mnemonic =
@@ -1118,6 +1137,21 @@ and gen_binop ctx op e1 e2 etype =
 		let o2 = gen_operand ctx e2 in
 		let s1 = match o1 with Imm s -> s | Reg r -> r in
 		let s2 = match o2 with Imm s -> s | Reg r -> r in
+		(* Mixed int/float: Haxe unifies to Float; convert int sides
+			explicitly (SA has no implicit conversion). Int literals
+			are fine as-is only when both sides are ints. *)
+		let s1 = if float_ctx && is_int_t e1.etype then begin
+			let r = fresh ctx "t" in
+			emit ctx (Printf.sprintf "%s = sitofp %s" r s1);
+			track ctx r;
+			r
+		end else s1 in
+		let s2 = if float_ctx && is_int_t e2.etype then begin
+			let r = fresh ctx "t" in
+			emit ctx (Printf.sprintf "%s = sitofp %s" r s2);
+			track ctx r;
+			r
+		end else s2 in
 		let r = fresh ctx "t" in
 		emit ctx (Printf.sprintf "%s = %s %s, %s" r mn s1 s2);
 		track ctx r;
@@ -1185,9 +1219,35 @@ and trace_fmt_int ctx arg =
 		emit ctx (Printf.sprintf "%s = call @sa_fmt_i64(%s, 10)" h vs);
 		track ctx h;
 		trace_buffered ctx h
+	| TAbstract ({ a_path = ([], "Float") }, _) ->
+		(* ts-plugin precedent: precision 6. Repr differs from Haxe's
+			shortest-round-tripNan (e.g. 1.5 -> "1.500000"); documented. *)
+		let vs = match gen_operand ctx arg with
+			| Imm s -> s | Reg r -> r in
+		let h = fresh ctx "h" in
+		emit ctx (Printf.sprintf "%s = call @sa_fmt_f64(%s, 6)" h vs);
+		track ctx h;
+		trace_buffered ctx h
 	| _ ->
-		comment ctx "SA-TODO(v0.6): Std.string(non-int)";
+		comment ctx "SA-TODO(v0.6): Std.string(non-numeric)";
 		false
+
+(** `Std.int(x)`: float truncation toward zero (fptosi); ints pass
+	through; anything else is an honest TODO. *)
+and gen_std_int ctx arg =
+	match follow arg.etype with
+	| TAbstract ({ a_path = ([], "Float") }, _) ->
+		let vs = match gen_operand ctx arg with
+			| Imm s -> s | Reg r -> r in
+		let r = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = fptosi %s" r vs);
+		track ctx r;
+		Reg r
+	| TAbstract ({ a_path = ([], "Int") }, _) ->
+		gen_operand ctx arg
+	| _ ->
+		comment ctx "SA-TODO(v0.12): Std.int(non-numeric)";
+		Imm "0"
 
 and trace_concat ctx l r =
 	let rec flatten acc e = match e.eexpr with
