@@ -192,4 +192,7 @@ struct 20%, array 10%)。按用户指令：基础特性优先，其次 hxml，�
 - v0.20: String 返回值 (`__retlen` 配对回传：签名/调用/TReturn/
   lens 全链路)；`br` 条件全量绑定；fixture StrRet；
   22 fixture 全绿。
+- v0.21: 结构 enum 相等 (tag 开关 + 逐构造载荷比较，
+  单测试寄存器 + 全路径快照纪律)；fixture EnumEq；
+  23 fixture 全绿。
 - 每个版本独立提交并推送，`sa_std` 缺失先补 `sci/sa_std`。

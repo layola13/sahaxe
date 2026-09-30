@@ -1271,10 +1271,9 @@ and gen_binop ctx op e1 e2 etype =
 	if (op = OpEq || op = OpNotEq)
 		&& (is_enum_t e1.etype || is_enum_t e2.etype)
 		&& not (is_null_expr e1 || is_null_expr e2)
-		&& not (is_tag_const e1 && is_tag_const e2) then begin
-		comment ctx "SA-TODO(v0.19): structural enum equality";
-		Imm "0"
-	end else if (op = OpEq || op = OpNotEq)
+		&& not (is_tag_const e1 && is_tag_const e2) then
+		gen_enum_eq ctx op e1 e2
+	else if (op = OpEq || op = OpNotEq)
 		&& (is_string_t e1.etype || is_string_t e2.etype)
 		&& not (is_null_expr e1 || is_null_expr e2) then
 		gen_string_eq ctx op e1 e2
@@ -1866,6 +1865,153 @@ and gen_enum_param ctx e ef index =
 		emit ctx (Printf.sprintf "%s = load %s+%d as %s" r b ((index + 1) * 8) ty);
 		track ctx r;
 		Reg r)
+
+(** Constructor payload mem-annotations by tag for an enum decl:
+	`[(tag, [mem-ty...])]` sorted by tag. None when any constructor
+	carries non-scalar payloads (String/nested → honest TODO) or the
+	type is not a concrete enum. *)
+and enum_ctor_info t =
+	match follow t with
+	| TEnum (e, _) ->
+		let ctors = PMap.fold (fun cf acc -> cf :: acc) e.e_constrs [] in
+		let info = List.map (fun cf ->
+			match follow cf.ef_type with
+			| TFun (params, _) ->
+				let tys = List.map (fun (_, _, pt) ->
+					match follow pt with
+					| TAbstract ({ a_path = ([], "Int") }, _)
+					| TAbstract ({ a_path = ([], "Bool") }, _) -> Some "i32"
+					| TAbstract ({ a_path = ([], "Float") }, _) -> Some "f64"
+					| _ -> None
+				) params in
+				if List.exists ((=) None) tys then None
+				else Some (cf.ef_index,
+					List.map (function Some s -> s | None -> "") tys)
+			| _ ->
+				Some (cf.ef_index, [])
+		) ctors in
+		if List.exists ((=) None) info then None
+		else Some (List.sort compare
+			(List.map (function Some x -> x | None -> (0, [])) info))
+	| _ -> None
+
+(** Structural enum equality: tags first, then per-constructor payload
+	words (scalar only). Merge discipline: res is defined exactly once
+	per path (DIFF/ZERO/arms); test/tag temps released on all paths. *)
+and gen_enum_eq ctx op e1 e2 =
+	let same_decls = match enum_ctor_info e1.etype, enum_ctor_info e2.etype with
+		| Some a, Some b when List.map fst a = List.map fst b -> Some a
+		| _ -> None in
+	match same_decls with
+	| None ->
+		comment ctx "SA-TODO(v0.21): enum eq needs scalar payloads";
+		Imm "0"
+	| Some infos ->
+	match gen_operand ctx e1, gen_operand ctx e2 with
+	| Reg a, Reg b ->
+		let snap_all = snapshot ctx in
+		let ta = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = load %s+0 as i32" ta a);
+		track ctx ta;
+		let tb = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = load %s+0 as i32" tb b);
+		track ctx tb;
+		let teq = fresh ctx "t" in
+		emit ctx (Printf.sprintf "%s = eq %s, %s" teq ta tb);
+		track ctx teq;
+		let res = fresh ctx "t" in
+		let et = fresh ctx "t" in
+		track ctx et;
+		let l_same = fresh_label ctx "EQSAME" in
+		let l_diff = fresh_label ctx "EQDIFF" in
+		let l_end = fresh_label ctx "EQEND" in
+		let first_test = ref true in
+		emit ctx (Printf.sprintf "br %s -> %s, %s" teq l_same l_diff);
+		emit_label ctx l_diff;
+		emit ctx (Printf.sprintf "%s = add 0, 0" res);
+		let saved_d = save_live ctx in
+		release_now ctx ta;
+		release_now ctx tb;
+		release_now ctx teq;
+		restore_live ctx saved_d;
+		emit ctx (Printf.sprintf "jmp %s" l_end);
+		emit_label ctx l_same;
+		let saved_tests = save_live ctx in
+		let emit_arm_body ptys =
+			let accr = ref "" in
+			List.iteri (fun i ty ->
+				let pa = fresh ctx "t" in
+				emit ctx (Printf.sprintf "%s = load %s+%d as %s" pa a ((i + 1) * 8) ty);
+				track ctx pa;
+				let pb = fresh ctx "t" in
+				emit ctx (Printf.sprintf "%s = load %s+%d as %s" pb b ((i + 1) * 8) ty);
+				track ctx pb;
+				let mn = if ty = "f64" then "fcmp_eq" else "eq" in
+				let c = fresh ctx "t" in
+				emit ctx (Printf.sprintf "%s = %s %s, %s" c mn pa pb);
+				track ctx c;
+				if !accr = "" then accr := c
+				else begin
+					let acc2 = fresh ctx "t" in
+					emit ctx (Printf.sprintf "%s = and %s, %s" acc2 !accr c);
+					track ctx acc2;
+					release_now ctx !accr;
+					release_now ctx c;
+					accr := acc2
+				end;
+				release_now ctx pa;
+				release_now ctx pb
+			) ptys;
+			if !accr = "" then emit ctx (Printf.sprintf "%s = add 1, 0" res)
+			else begin
+				emit ctx (Printf.sprintf "%s = add %s, 0" res !accr);
+				release_now ctx !accr
+			end;
+			emit ctx (Printf.sprintf "jmp %s" l_end) in
+		let rec arms = function
+			| [] -> ()
+			| [(tag, ptys)] ->
+				if not !first_test then emit ctx ("!" ^ et);
+				first_test := false;
+				emit ctx (Printf.sprintf "%s = eq %s, %d" et ta tag);
+				let l_arm = fresh_label ctx "EQARM" in
+				let l_zero = fresh_label ctx "EQZERO" in
+				emit ctx (Printf.sprintf "br %s -> %s, %s" et l_arm l_zero);
+				emit_label ctx l_arm;
+				restore_live ctx saved_tests;
+				release_since ctx snap_all;
+				emit_arm_body ptys;
+				emit_label ctx l_zero;
+				restore_live ctx saved_tests;
+				release_since ctx snap_all;
+				emit ctx (Printf.sprintf "%s = add 0, 0" res);
+				emit ctx (Printf.sprintf "jmp %s" l_end)
+			| (tag, ptys) :: rest ->
+				if not !first_test then emit ctx ("!" ^ et);
+				first_test := false;
+				emit ctx (Printf.sprintf "%s = eq %s, %d" et ta tag);
+				let l_arm = fresh_label ctx "EQARM" in
+				let l_next = fresh_label ctx "EQNEXT" in
+				emit ctx (Printf.sprintf "br %s -> %s, %s" et l_arm l_next);
+				emit_label ctx l_arm;
+				restore_live ctx saved_tests;
+				release_since ctx snap_all;
+				emit_arm_body ptys;
+				emit_label ctx l_next;
+				arms rest in
+		arms infos;
+		emit_label ctx l_end;
+		restore_live ctx (keep_oldest snap_all saved_tests);
+		track ctx res;
+		if op = OpNotEq then begin
+			let n = fresh ctx "t" in
+			emit ctx (Printf.sprintf "%s = eq %s, 0" n res);
+			track ctx n;
+			Reg n
+		end else Reg res
+	| _ ->
+		comment ctx "SA-TODO(v0.21): enum base must be registers";
+		Imm "0"
 
 and gen_switch ctx sw =
 	let all_pats = List.concat (List.map (fun c -> c.case_patterns) sw.switch_cases) in
