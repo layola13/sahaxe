@@ -149,6 +149,7 @@ struct 20%, array 10%)。按用户指令：基础特性优先，其次 hxml，�
   条件 `@import "sa_std/string.sa")；单测试寄存器复用；
   存活表路径纪律 (save/restore/keep_oldest)，Referee 全绿
   (8 fixtures 零 TODO + `sa check` 零 trap)。
-- v0.7: hxml 工程支持 (`--sa` 与现有 `--next/--each` 批处理互通)。
+- v0.7 (本提交): hxml 工程互通 — `--sa` 走通用管线，
+  hxml/`--next` 批处理零代码可用 (fixture `tests/sa-demo/build.hxml`)。
 - v0.8: 宏 (`--macro`) 在 SA 目标下的求值与展开。
 - 每个版本独立提交并推送，`sa_std` 缺失先补 `sci/sa_std`。
