@@ -277,22 +277,50 @@ let scalar_param t = match scalar_ret t with
 	| Some "void" -> None
 	| x -> x
 
-(** A static helper is emittable when it is a plain method with a body
-	and an all-scalar signature (by-value ints/floats/bools only;
-	borrow/move prefixes for aggregate params are v0.6). *)
+(** Expanded parameter: scalars pass by value, strings as
+	`(name_ptr: ptr, name_len: u64)` borrow pairs. *)
+type param_exp =
+	| Scalar of tvar * string
+	| StrPair of tvar
+
+let str_ptr_name v = v.v_name ^ "_ptr"
+let str_len_name v = v.v_name ^ "_len"
+
+(** Expand tf_args against the TFun formal types. None = some param
+	is neither scalar nor String (function skipped honestly). *)
+let expand_sig tf args ret_of =
+	let formals = List.map (fun (_, _, t) -> t) args in
+	let paired =
+		try List.combine (List.map fst tf.tf_args) formals
+		with Invalid_argument _ -> [] in
+	if List.length paired <> List.length tf.tf_args then None
+	else begin
+		let exps = List.map (fun (v, t) ->
+			if is_string_t t then Some (StrPair v)
+			else match scalar_param t with
+				| Some ty -> Some (Scalar (v, ty))
+				| None -> None
+		) paired in
+		if List.exists ((=) None) exps then None
+		else
+			let exps = List.map (function Some x -> x | None -> assert false) exps in
+			match ret_of with
+			| None -> Some (tf, exps, "")
+			| Some rt -> (match scalar_ret rt with
+				| None -> None
+				| Some rs -> Some (tf, exps, rs))
+	end
+
+(** A static helper is emittable when it is a plain method with a body;
+	params may be scalars or Strings (borrow pairs); other aggregates
+	and non-scalar returns skip it honestly. *)
 let emittable_static cf =
 	match cf.cf_kind with
 	| Method MethNormal | Method MethInline -> begin
 		match cf.cf_expr with
 		| Some { eexpr = TFunction tf } -> begin
 			match follow cf.cf_type with
-			| TFun (args, ret) ->
-				let ptys = List.map (fun (_, _, t) -> scalar_param t) args in
-				if List.exists ((=) None) ptys then None
-				else (match scalar_ret ret with
-					| None -> None
-					| Some rt -> Some (tf,
-						List.map (function Some s -> s | None -> "") ptys, rt))
+			| TFun (args, ret) -> expand_sig tf args (Some ret)
 			| _ -> None
 		end
 		| _ -> None
@@ -341,8 +369,8 @@ let rec has_return e =
 	| TParenthesis e1 | TMeta (_, e1) | TCast (e1, _) -> has_return e1
 	| _ -> false
 
-(** An emittable constructor: plain method named `new`, scalar params,
-	body without explicit returns. *)
+(** An emittable constructor: plain method named `new`, scalar/String
+	params, body without explicit returns. *)
 let emittable_ctor c cf =
 	if cf.cf_name <> "new" then None
 	else match cf.cf_kind with
@@ -350,32 +378,27 @@ let emittable_ctor c cf =
 		match cf.cf_expr with
 		| Some { eexpr = TFunction tf } -> begin
 			match follow cf.cf_type with
-			| TFun (args, _) ->
-				let ptys = List.map (fun (_, _, t) -> scalar_param t) args in
-				if List.exists ((=) None) ptys then None
-				else if has_return tf.tf_expr then None
-				else Some (tf,
-					List.map (function Some s -> s | None -> "") ptys)
+			| TFun (args, _) -> begin
+				match expand_sig tf args None with
+				| None -> None
+				| Some (tf, exps, _) ->
+					if has_return tf.tf_expr then None
+					else Some (tf, exps)
+			end
 			| _ -> None
 		end
 		| _ -> None
 	end
 	| _ -> None
 
-(** An emittable instance method: scalar params/return like statics. *)
+(** An emittable instance method: like statics, plus implicit self. *)
 let emittable_method cf =
 	match cf.cf_kind with
 	| Method MethNormal | Method MethInline -> begin
 		match cf.cf_expr with
 		| Some { eexpr = TFunction tf } -> begin
 			match follow cf.cf_type with
-			| TFun (args, ret) ->
-				let ptys = List.map (fun (_, _, t) -> scalar_param t) args in
-				if List.exists ((=) None) ptys then None
-				else (match scalar_ret ret with
-					| None -> None
-					| Some rt -> Some (tf,
-						List.map (function Some s -> s | None -> "") ptys, rt))
+			| TFun (args, ret) -> expand_sig tf args (Some ret)
 			| _ -> None
 		end
 		| _ -> None
@@ -914,8 +937,17 @@ and gen_new ctx c args =
 		comment ctx ("SA-TODO(v0.9): non-emitted ctor " ^ s_type_path c.cl_path);
 		Imm "0"
 	end else begin
-		let ss = List.map (fun a ->
-			match gen_operand ctx a with Imm s -> s | Reg r -> r) args in
+		let ss = match c.cl_constructor with
+			| None -> Some (List.map (fun a ->
+				match gen_operand ctx a with Imm s -> s | Reg r -> r) args)
+			| Some ccf -> (match splice_args ctx ccf args with
+				| Some s -> Some s
+				| None ->
+					comment ctx "SA-TODO(v0.13): unresolvable ctor argument";
+					None) in
+		match ss with
+		| None -> Imm "0"
+		| Some ss ->
 		let r = fresh ctx "t" in
 		emit ctx (Printf.sprintf "%s = call @%s(%s)" r name (String.concat ", " ss));
 		track ctx r;
@@ -932,8 +964,11 @@ and gen_method_call ctx c cf obj args =
 	end else begin
 		let so = gen_operand ctx obj in
 		let ss = match so with Imm s -> s | Reg r -> r in
-		let rest = List.map (fun a ->
-			match gen_operand ctx a with Imm s -> s | Reg r -> r) args in
+		match splice_args ctx cf args with
+		| None ->
+			comment ctx "SA-TODO(v0.13): unresolvable method argument";
+			Imm "0"
+		| Some rest ->
 		let ret = match follow cf.cf_type with
 			| TFun (_, r) -> scalar_ret r
 			| _ -> None in
@@ -1187,7 +1222,9 @@ and trace_string_value ctx e : bool =
 	| TParenthesis e1 | TMeta (_, e1) | TCast (e1, _) -> trace_string_value ctx e1
 	| _ -> match string_operands ctx e with
 		| Some (p, l) ->
-			emit ctx (Printf.sprintf "call @sa_print_bytes(%s, %s)" p l);
+			let ps = (match ctx.pslot with Some s -> s | None -> ensure_pslot ctx) in
+			emit ctx (Printf.sprintf "store %s+0, %s as ptr" ps p);
+			emit ctx (Printf.sprintf "call @sa_print_bytes(&%s, %s)" ps l);
 			true
 		| None -> false
 
@@ -1742,7 +1779,7 @@ and gen_stmt ctx e =
 		comment ctx ("SA-TODO: unsupported statement " ^ expr_kind e);
 		false
 
-and gen_function fctx name tf ptys ret body_stmts this_kind =
+and gen_function fctx name tf exps ret body_stmts this_kind =
 	ignore (ensure_pslot fctx);
 	(* `this` homing: constructors allocate, methods home the self
 		param. The slot makes field access uniform with locals. *)
@@ -1764,16 +1801,26 @@ and gen_function fctx name tf ptys ret body_stmts this_kind =
 			fctx.this_slot <- Some slot;
 			None
 		| `NoThis -> None in
-	let fvars = List.combine (List.map fst tf.tf_args) ptys in
-	List.iter (fun (v, ty) ->
-		let slot = fresh fctx "var" in
-		Hashtbl.replace fctx.vars v.v_id slot;
-		emit fctx (Printf.sprintf "%s = stack_alloc 8" slot);
-		emit fctx (Printf.sprintf "store %s+0, %s as %s" slot v.v_name ty);
-		(* Params are live registers too: homing copies them, the
-			originals must still be released on every exit. *)
-		track fctx v.v_name
-	) fvars;
+	(* Parameter homing: scalars copy by value; String pairs home the
+		data pointer and record the live length. *)
+	List.iter (function
+		| Scalar (v, ty) ->
+			let slot = fresh fctx "var" in
+			Hashtbl.replace fctx.vars v.v_id slot;
+			emit fctx (Printf.sprintf "%s = stack_alloc 8" slot);
+			emit fctx (Printf.sprintf "store %s+0, %s as %s" slot v.v_name ty);
+			(* Params are live registers too: homing copies them, the
+				originals must still be released on every exit. *)
+			track fctx v.v_name
+		| StrPair v ->
+			let slot = fresh fctx "var" in
+			Hashtbl.replace fctx.vars v.v_id slot;
+			emit fctx (Printf.sprintf "%s = stack_alloc 8" slot);
+			emit fctx (Printf.sprintf "store %s+0, %s as ptr" slot (str_ptr_name v));
+			Hashtbl.replace fctx.str_lens v.v_id (Reg (str_len_name v));
+			track fctx (str_ptr_name v);
+			track fctx (str_len_name v)
+	) exps;
 	let hoist = List.concat (List.map (collect_vars []) body_stmts) in
 	List.iter (fun v ->
 		if not (Hashtbl.mem fctx.vars v.v_id) then begin
@@ -1796,7 +1843,11 @@ and gen_function fctx name tf ptys ret body_stmts this_kind =
 			| _ -> emit fctx "return 0")
 	end;
 	let b = Buffer.create 2048 in
-	let params = List.map (fun (v, ty) -> Printf.sprintf "%s: %s" v.v_name ty) fvars in
+	let params = List.concat (List.map (function
+		| Scalar (v, ty) -> [Printf.sprintf "%s: %s" v.v_name ty]
+		| StrPair v -> [Printf.sprintf "%s: ptr" (str_ptr_name v);
+			Printf.sprintf "%s: u64" (str_len_name v)]
+	) exps) in
 	let params = match this_kind with
 		| `ThisParam -> "self: ptr" :: params
 		| _ -> params in
@@ -1811,16 +1862,38 @@ L_ENTRY:
 
 
 (** Lower a static call to an emitted helper. Arguments evaluate
-	left-to-right; void calls emit bare `call`, value calls `r = call`. *)
+	left-to-right; void calls emit bare `call`, value calls `r = call`.
+	String formals splice to `(ptr, len)` pairs via string_operands. *)
+and splice_args ctx cf args : string list option =
+	let formals = match follow cf.cf_type with
+		| TFun (f, _) -> List.map (fun (_, _, t) -> t) f
+		| _ -> [] in
+	let rec loop acc = function
+		| [], [] -> Some (List.rev acc)
+		| a :: rest_a, t :: rest_t ->
+			if is_string_t t then
+				(match string_operands ctx a with
+				| Some (p, l) -> loop (l :: p :: acc) (rest_a, rest_t)
+				| None -> None)
+			else begin
+				let s = match gen_operand ctx a with
+					| Imm s -> s | Reg r -> r in
+				loop (s :: acc) (rest_a, rest_t)
+			end
+		| _ -> None in
+	loop [] (args, formals)
+
 and gen_call ctx c cf args =
 	let name = sa_fun_name c cf in
 	if not (Hashtbl.mem ctx.emitted name) then begin
 		comment ctx ("SA-TODO(v0.6): call to non-emitted " ^
 			s_type_path c.cl_path ^ "." ^ cf.cf_name);
 		Imm "0"
-	end else begin
-		let ss = List.map (fun a ->
-			match gen_operand ctx a with Imm s -> s | Reg r -> r) args in
+	end else match splice_args ctx cf args with
+	| None ->
+		comment ctx "SA-TODO(v0.13): unresolvable call argument";
+		Imm "0"
+	| Some ss -> begin
 		let ret = match follow cf.cf_type with
 			| TFun (_, r) -> scalar_ret r
 			| _ -> None in
@@ -1892,21 +1965,21 @@ let generate com =
 		if cf.cf_name = "main" || Hashtbl.mem done_keys k then ()
 		else match emittable_static cf with
 			| None -> ()
-			| Some (tf, ptys, ret) ->
+			| Some (tf, exps, ret) ->
 				Hashtbl.replace done_keys k ();
 				let name = sa_fun_name c cf in
 				register name;
-				helpers := (name, tf, ptys, ret, `NoThis) :: !helpers in
+				helpers := (name, tf, exps, ret, `NoThis) :: !helpers in
 	let emit_method c cf =
 		let k = "method:" ^ s_type_path c.cl_path ^ "." ^ cf.cf_name in
 		if Hashtbl.mem done_keys k then ()
 		else match emittable_method cf with
 		| None -> ()
-		| Some (tf, ptys, ret) ->
+		| Some (tf, exps, ret) ->
 			Hashtbl.replace done_keys k ();
 			let name = sa_fun_name c cf in
 			register name;
-			helpers := (name, tf, ptys, ret, `ThisParam) :: !helpers in
+			helpers := (name, tf, exps, ret, `ThisParam) :: !helpers in
 	let emit_ctor c =
 		let k = "ctor:" ^ s_type_path c.cl_path in
 		if Hashtbl.mem done_keys k then ()
@@ -1916,10 +1989,10 @@ let generate com =
 			| None -> ()
 			| Some cf -> match emittable_ctor c cf with
 				| None -> ()
-				| Some (tf, ptys) ->
+				| Some (tf, exps) ->
 					let name = sa_ctor_name c in
 					register name;
-					helpers := (name, tf, ptys, "ptr", `ThisAlloc (class_size c)) :: !helpers
+					helpers := (name, tf, exps, "ptr", `ThisAlloc (class_size c)) :: !helpers
 		end in
 	(match main_class with
 	| None -> ()
@@ -1965,12 +2038,12 @@ let generate com =
 		emit ctx "return 0"
 	end;
 	(* Lower helper bodies with fresh scopes sharing header/emitted. *)
-	List.iter (fun (name, tf, ptys, ret, this_kind) ->
+	List.iter (fun (name, tf, exps, ret, this_kind) ->
 		let fctx = new_fun_ctx com header emitted funcs in
 		let body_stmts = match tf.tf_expr.eexpr with
 			| TBlock el -> el
 			| _ -> [tf.tf_expr] in
-		gen_function fctx name tf ptys ret body_stmts this_kind
+		gen_function fctx name tf exps ret body_stmts this_kind
 	) !helpers;
 	let ch = open_out_bin com.file in
 	output_string ch "// Generated by the Haxe SA target v0.5.\n";
