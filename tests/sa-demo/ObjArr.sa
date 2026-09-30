@@ -83,8 +83,6 @@ L_COND0:
     t10 = slt t9, 2
     br t10 -> L_BODY1, L_ENDWHILE2
 L_BODY1:
-    !t9
-    !t10
     t11 = load var0+0 as ptr
     t12 = load var1+0 as i32
     off13 = mul t12, 8
@@ -102,6 +100,8 @@ L_BODY1:
     t23 = load var1+0 as i32
     t24 = add t23, 1
     store var1+0, t24 as i32
+    !t9
+    !t10
     !t11
     !t12
     !off13
@@ -134,15 +134,11 @@ L_ELSE5:
     call @sa_print_bytes(&STR_1, 10)
     jmp L_ENDIF4
 L_ENDIF4:
-    !var0
-    !var1
-    !var2
-    !var3
-    !var4
-    !var5
     !arr6
     !obj7
     !obj8
+    !t9
+    !t10
     !t25
     !t26
     !t27

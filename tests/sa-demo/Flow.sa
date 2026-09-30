@@ -70,9 +70,6 @@ L_COND0:
     t5 = slt t3, t4
     br t5 -> L_BODY1, L_ENDWHILE2
 L_BODY1:
-    !t3
-    !t4
-    !t5
     t6 = load var2+0 as i32
     t7 = add t6, 1
     store var2+0, t7 as i32
@@ -80,6 +77,9 @@ L_BODY1:
     t9 = eq t8, 5
     br t9 -> L_THEN3, L_ENDIF4
 L_THEN3:
+    !t3
+    !t4
+    !t5
     !t6
     !t7
     !t8
@@ -90,12 +90,25 @@ L_ENDIF4:
     t11 = sgt t10, 7
     br t11 -> L_THEN5, L_ENDIF6
 L_THEN5:
+    !t6
+    !t7
+    !t8
+    !t9
+    !t10
+    !t11
     jmp L_ENDWHILE2
 L_ENDIF6:
     t12 = load var1+0 as i32
     t13 = load var2+0 as i32
     t14 = add t12, t13
     store var1+0, t14 as i32
+    !t3
+    !t4
+    !t5
+    !t6
+    !t7
+    !t8
+    !t9
     !t10
     !t11
     !t12
@@ -113,9 +126,9 @@ L_ELSE9:
     call @sa_print_bytes(&STR_1, 3)
     jmp L_ENDIF8
 L_ENDIF8:
-    !var0
-    !var1
-    !var2
+    !t3
+    !t4
+    !t5
     !t15
     !t16
     return 0

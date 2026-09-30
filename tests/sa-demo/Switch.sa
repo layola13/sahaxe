@@ -68,61 +68,68 @@ L_ENTRY:
     t5 = load var0+0 as ptr
     store var2+0, t5 as i32
     t6 = load var2+0 as i32
-    t7 = eq t6, 0
-    br t7 -> L_ARM1_0, L_SWNEXT2
-L_SWNEXT2:
-    t8 = eq t6, 1
-    br t8 -> L_ARM1_1, L_SWOR3
-L_SWOR3:
-    t9 = eq t6, 2
-    br t9 -> L_ARM1_1, L_ENDSWITCH0
+    swt7 = eq t6, 0
+    br swt7 -> L_ARM1_0, L_SWNEXT3
+L_SWNEXT3:
+    !swt7
+    swt7 = eq t6, 1
+    br swt7 -> L_ARM1_1, L_SWOR4
+L_SWOR4:
+    !swt7
+    swt7 = eq t6, 2
+    br swt7 -> L_ARM1_1, L_SWNOMATCH2
+L_SWNOMATCH2:
+    !t6
+    !swt7
+    jmp L_ENDSWITCH0
 L_ARM1_0:
     store var1+0, 1 as i32
+    !t6
+    !swt7
     jmp L_ENDSWITCH0
 L_ARM1_1:
     store var1+0, 2 as i32
+    !t6
+    !swt7
     jmp L_ENDSWITCH0
 L_ENDSWITCH0:
     store var3+0, 0 as i32
-    t10 = load var1+0 as i32
-    store var4+0, t10 as i32
-    t11 = load var4+0 as i32
-    t12 = eq t11, 1
-    br t12 -> L_ARM5_0, L_SWNEXT6
-L_SWNEXT6:
-    t13 = eq t11, 2
-    br t13 -> L_ARM5_1, L_ENDSWITCH4
-L_ARM5_0:
-    store var3+0, 10 as i32
-    jmp L_ENDSWITCH4
-L_ARM5_1:
-    store var3+0, 20 as i32
-    jmp L_ENDSWITCH4
-L_ENDSWITCH4:
-    t14 = load var3+0 as i32
-    t15 = eq t14, 20
-    br t15 -> L_THEN7, L_ELSE9
-L_THEN7:
-    call @sa_print_bytes(&STR_0, 9)
-    jmp L_ENDIF8
-L_ELSE9:
-    call @sa_print_bytes(&STR_1, 10)
-    jmp L_ENDIF8
-L_ENDIF8:
-    !var0
-    !var1
-    !var2
-    !var3
-    !var4
-    !t5
-    !t6
-    !t7
-    !t8
+    t8 = load var1+0 as i32
+    store var4+0, t8 as i32
+    t9 = load var4+0 as i32
+    swt10 = eq t9, 1
+    br swt10 -> L_ARM6_0, L_SWNEXT8
+L_SWNEXT8:
+    !swt10
+    swt10 = eq t9, 2
+    br swt10 -> L_ARM6_1, L_SWNOMATCH7
+L_SWNOMATCH7:
     !t9
-    !t10
+    !swt10
+    jmp L_ENDSWITCH5
+L_ARM6_0:
+    store var3+0, 10 as i32
+    !t9
+    !swt10
+    jmp L_ENDSWITCH5
+L_ARM6_1:
+    store var3+0, 20 as i32
+    !t9
+    !swt10
+    jmp L_ENDSWITCH5
+L_ENDSWITCH5:
+    t11 = load var3+0 as i32
+    t12 = eq t11, 20
+    br t12 -> L_THEN9, L_ELSE11
+L_THEN9:
+    call @sa_print_bytes(&STR_0, 9)
+    jmp L_ENDIF10
+L_ELSE11:
+    call @sa_print_bytes(&STR_1, 10)
+    jmp L_ENDIF10
+L_ENDIF10:
+    !t5
+    !t8
     !t11
     !t12
-    !t13
-    !t14
-    !t15
     return 0

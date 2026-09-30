@@ -71,6 +71,10 @@ type ctx = {
 		`entry_snap` regs; all edges into L_END carry `cond_snap` regs,
 		so every merge is Phi-consistent (see sala 06_limitations). *)
 	mutable loops : (string * string * int * int ref) list;
+	(** String lengths: slots hold only the pointer, so lengths of
+		string-typed locals are tracked here (v_id -> Imm length or
+		Reg holding it). Unknown = absent. *)
+	str_lens : (int, operand) Hashtbl.t;
 }
 
 let fresh ctx prefix =
@@ -101,8 +105,25 @@ let emit_label ctx l =
 let track ctx r =
 	ctx.live <- r :: ctx.live
 
-(** True when the (followed) type is Haxe Float. Everything else is
-	treated as i32 for v0.2 (ints, bools as 0/1, chars). *)
+(** Path-discipline helpers: sibling branch paths are generated
+	sequentially but execute exclusively. Each arm must start from the
+	branch-entry list state, or releases emitted for one path corrupt
+	the bookkeeping of later siblings (Referee UnknownRegister /
+	PhiStateConflict). *)
+let save_live ctx = ctx.live
+
+let restore_live ctx s = ctx.live <- s
+
+let rec take_live n lst =
+	if n <= 0 then [] else match lst with
+	| [] -> []
+	| x :: xs -> x :: take_live (n - 1) xs
+
+(** Keep the OLDEST n entries (the merge survivors); drop newer temps.
+	Used when restoring bookkeeping after a multi-path construct. *)
+let keep_oldest n lst =
+	List.rev (take_live n (List.rev lst))
+
 let is_float_t t =
 	match follow t with
 	| TAbstract ({ a_path = ([], "Float") }, _) -> true
@@ -141,6 +162,47 @@ let intern_string ctx s =
 	Buffer.add_string ctx.header
 		(Printf.sprintf "@const %s = utf8:\"%s\"\n" name (sa_escape s));
 	(name, String.length s)
+
+(** True when the (followed) type is Haxe String. *)
+let is_string_t t =
+	match follow t with
+	| TInst ({ cl_path = ([], "String") }, _) -> true
+	| _ -> false
+
+(** Resolve a string expression to (ptr_src, len_src) source strings.
+	Literals intern inline; locals need a tracked length. *)
+let rec string_operands ctx e =
+	match e.eexpr with
+	| TConst (TString s) ->
+		let (name, len) = intern_string ctx s in
+		Some ("&" ^ name, string_of_int len)
+	| TLocal v when is_string_t v.v_type -> begin
+		try
+			let slot = Hashtbl.find ctx.vars v.v_id in
+			let b = fresh ctx "t" in
+			emit ctx (Printf.sprintf "%s = load %s+0 as ptr" b slot);
+			track ctx b;
+			let ls = match Hashtbl.find ctx.str_lens v.v_id with
+				| Imm s -> s | Reg r -> r in
+			Some (b, ls)
+		with Not_found -> None
+	end
+	| TParenthesis e1 | TMeta (_, e1) | TCast (e1, _) -> string_operands ctx e1
+	| _ -> None
+
+(** Record a string local's length from its initializer. *)
+let track_str_len ctx v init_opt =
+	if is_string_t v.v_type then begin
+		let len_opt = match init_opt with
+			| Some { eexpr = TConst (TString s) } -> Some (Imm (string_of_int (String.length s)))
+			| Some { eexpr = TLocal w } ->
+				(try Some (Hashtbl.find ctx.str_lens w.v_id) with Not_found -> None)
+			| _ -> None in
+		match len_opt with
+		| Some l -> Hashtbl.replace ctx.str_lens v.v_id l
+		| None ->
+			Hashtbl.remove ctx.str_lens v.v_id
+	end
 
 let expr_kind e =
 	match e.eexpr with
@@ -200,8 +262,19 @@ let new_fun_ctx com header emitted funcs = {
 	next_reg = 0; next_str = 0; next_label = 0;
 	vars = Hashtbl.create 16; live = []; loops = [];
 	emitted; funcs;
+	str_lens = Hashtbl.create 8;
 }
 
+(** Null test (a `null` side of `==` compares pointers, correctly). *)
+let rec is_null_expr e =
+	match e.eexpr with
+	| TConst TNull -> true
+	| TParenthesis e1 | TMeta (_, e1) | TCast (e1, _) -> is_null_expr e1
+	| _ -> false
+
+(** String `==` / `!=` via the supplemented `STRING_EQ`/`STRING_NEQ`
+	macros (pointer comparison would be wrong for content). A `null`
+	side falls through to plain pointer comparison. *)
 (** Resolve the entry body: `main_expr` is usually a `TCall` to the
 	static `main` method (or a `TBlock` ending in the `EntryPoint.run`
 	call). Returns the statements, whether the entry takes arguments,
@@ -525,6 +598,11 @@ and gen_array_len ctx base =
 		Reg r
 
 and gen_binop ctx op e1 e2 etype =
+	if (op = OpEq || op = OpNotEq)
+		&& (is_string_t e1.etype || is_string_t e2.etype)
+		&& not (is_null_expr e1 || is_null_expr e2) then
+		gen_string_eq ctx op e1 e2
+	else begin
 	let float_ctx = is_float_t e1.etype || is_float_t e2.etype || is_float_t etype in
 	let int_mnemonic = match op with
 		| OpAdd -> Some "add" | OpSub -> Some "sub" | OpMult -> Some "mul"
@@ -560,8 +638,20 @@ and gen_binop ctx op e1 e2 etype =
 		emit ctx (Printf.sprintf "%s = %s %s, %s" r mn s1 s2);
 		track ctx r;
 		Reg r
+	end
 
-(** SA name for a Haxe static: `hx_<flat path>_<method>`. *)
+and gen_string_eq ctx op e1 e2 =
+	match string_operands ctx e1, string_operands ctx e2 with
+	| Some (p1, l1), Some (p2, l2) ->
+		let r = fresh ctx "t" in
+		let mn = if op = OpEq then "STRING_EQ" else "STRING_NEQ" in
+		emit ctx (Printf.sprintf "EXPAND %s %s, %s, %s, %s, %s" mn r p1 l1 p2 l2);
+		track ctx r;
+		Reg r
+	| _ ->
+		comment ctx "SA-TODO(v0.6): string compare needs tracked lengths";
+		Imm "0"
+
 and entry_stmts e =
 	match e.eexpr with
 	| TBlock el ->
@@ -651,16 +741,43 @@ and switch_pat_const e =
 	| _ -> None
 
 (** `switch` -> `eq` + `br` chains (see sala 06_limitations: no
-	structured switch in SA). Subject evaluated once; arm temps
-	released symmetrically like `if` arms. *)
+	structured switch in SA). Subject evaluated once; ALL arms release
+	to the pre-subject snapshot so every edge into the merge label
+	carries the same live set. String subjects use the supplemented
+	`STRING_EQ` macro via per-pattern EXPANDs. *)
 and gen_switch ctx sw =
 	let all_pats = List.concat (List.map (fun c -> c.case_patterns) sw.switch_cases) in
-	if List.exists (fun p -> switch_pat_const p = None) all_pats then begin
-		comment ctx "SA-TODO(v0.6): exotic switch patterns (string/guard/payload)";
+	let str_mode = is_string_t sw.switch_subject.etype in
+	let str_pats = List.map (fun p -> match p.eexpr with
+		| TConst (TString s) ->
+			let (name, len) = intern_string ctx s in
+			Some ("&" ^ name, string_of_int len)
+		| TParenthesis e1 | TMeta (_, e1) | TCast (e1, _) -> begin
+			match e1.eexpr with
+			| TConst (TString s) ->
+				let (name, len) = intern_string ctx s in
+				Some ("&" ^ name, string_of_int len)
+			| _ -> None
+		end
+		| _ -> None) all_pats in
+	if str_mode && List.exists ((=) None) str_pats then begin
+		comment ctx "SA-TODO(v0.6): exotic string switch patterns";
+		false
+	end else if (not str_mode)
+		&& List.exists (fun p -> switch_pat_const p = None) all_pats then begin
+		comment ctx "SA-TODO(v0.6): exotic switch patterns (guard/payload)";
 		false
 	end else begin
-		let so = gen_operand ctx sw.switch_subject in
-		let ss = match so with Imm s -> s | Reg r -> r in
+		let snap_all = snapshot ctx in
+		let subj_str = if str_mode then string_operands ctx sw.switch_subject else None in
+		if str_mode && subj_str = None then begin
+			comment ctx "SA-TODO(v0.6): string switch needs tracked lengths";
+			false
+		end else begin
+		let ss = if str_mode then "" else
+			match gen_operand ctx sw.switch_subject with
+			| Imm s -> s | Reg r -> r in
+		let ssubj = match subj_str with Some x -> x | None -> ("", "") in
 		let l_end = fresh_label ctx "ENDSWITCH" in
 		let l_def = match sw.switch_default with
 			| Some _ -> Some (fresh_label ctx "SWDEF")
@@ -669,37 +786,105 @@ and gen_switch ctx sw =
 		ctx.next_label <- ctx.next_label + 1;
 		let arms = List.mapi (fun i c ->
 			(Printf.sprintf "L_ARM%d_%d" tag i, c)) sw.switch_cases in
+		(* No-default no-match edge would carry test temps into the
+			merge while arms release them: route it through a
+			trampoline that normalizes to snap_all first. *)
+		let l_nomatch = match sw.switch_default, arms with
+			| None, _ :: _ -> Some (fresh_label ctx "SWNOMATCH")
+			| _ -> None in
+		let str_pat_list = List.map (function Some x -> x | None -> ("", "")) str_pats in
+		let str_idx = ref str_pat_list in
+		(* Single reusable test register: redefined per test after an
+			explicit release, so every merge edge carries the same live
+			set (no per-test temp pileup). *)
+		let swt = fresh ctx "swt" in
+		track ctx swt;
+		let first_test = ref true in
+		let reuse_test emit_body =
+			if not !first_test then emit ctx ("!" ^ swt);
+			first_test := false;
+			emit_body swt in
+		let next_str_pats n =
+			let rec take k acc l = match k, l with
+				| 0, _ -> (List.rev acc, l)
+				| _, [] -> (List.rev acc, [])
+				| _, x :: xs -> take (k - 1) (x :: acc) xs in
+			let (a, b) = take n [] !str_idx in
+			str_idx := b; a in
 		let rec emit_tests = function
 			| [] -> ()
 			| (arm_label, c) :: rest ->
-				let ft = match rest, l_def with
-					| [], None -> l_end
-					| [], Some d -> d
+				let ft = match rest, l_def, l_nomatch with
+					| [], None, Some nm -> nm
+					| [], None, None -> l_end
+					| [], Some d, _ -> d
 					| _ -> fresh_label ctx "SWNEXT" in
 				if c.case_patterns = [] then
 					emit ctx (Printf.sprintf "jmp %s" arm_label)
-				else begin
+				else if str_mode then begin
+					let sps = next_str_pats (List.length c.case_patterns) in
+					let rec one_spat = function
+						| [] -> ()
+						| [(pp, lp)] ->
+							let (ps, ls) = ssubj in
+							reuse_test (fun t ->
+								emit ctx (Printf.sprintf "EXPAND STRING_EQ %s, %s, %s, %s, %s"
+									t ps ls pp lp));
+							emit ctx (Printf.sprintf "br %s -> %s, %s" swt arm_label ft);
+							let is_fall = match l_def with
+								| Some d -> ft <> l_end && ft <> d
+								| None -> ft <> l_end in
+							if is_fall then begin
+								emit_label ctx ft;
+								(match l_nomatch with
+								| Some nm when nm = ft ->
+									let saved_t = save_live ctx in
+									release_since ctx snap_all;
+									emit ctx (Printf.sprintf "jmp %s" l_end);
+									restore_live ctx saved_t
+								| _ -> ())
+							end
+						| (pp, lp) :: sps ->
+							let (ps, ls) = ssubj in
+							reuse_test (fun t ->
+								emit ctx (Printf.sprintf "EXPAND STRING_EQ %s, %s, %s, %s, %s"
+									t ps ls pp lp));
+							let l_or = fresh_label ctx "SWOR" in
+							emit ctx (Printf.sprintf "br %s -> %s, %s" swt arm_label l_or);
+							emit_label ctx l_or;
+							one_spat sps
+					in
+					one_spat sps;
+					emit_tests rest
+				end else begin
 				let rec one_pat = function
 					| [] -> ()
 					| [p] ->
 						let ps = match switch_pat_const p with
 							| Some s -> s | None -> "0" in
-						let t = fresh ctx "t" in
-						emit ctx (Printf.sprintf "%s = eq %s, %s" t ss ps);
-						track ctx t;
-						emit ctx (Printf.sprintf "br %s -> %s, %s" t arm_label ft);
+						reuse_test (fun t ->
+							emit ctx (Printf.sprintf "%s = eq %s, %s" t ss ps));
+						emit ctx (Printf.sprintf "br %s -> %s, %s" swt arm_label ft);
 						let is_fall = match l_def with
 							| Some d -> ft <> l_end && ft <> d
 							| None -> ft <> l_end in
-						if is_fall then emit_label ctx ft
+						if is_fall then begin
+							emit_label ctx ft;
+							(match l_nomatch with
+							| Some nm when nm = ft ->
+								let saved_t = save_live ctx in
+								release_since ctx snap_all;
+								emit ctx (Printf.sprintf "jmp %s" l_end);
+								restore_live ctx saved_t
+							| _ -> ())
+						end
 					| p :: ps ->
 						let pcs = match switch_pat_const p with
 							| Some s -> s | None -> "0" in
-						let t = fresh ctx "t" in
-						emit ctx (Printf.sprintf "%s = eq %s, %s" t ss pcs);
-						track ctx t;
+						reuse_test (fun t ->
+							emit ctx (Printf.sprintf "%s = eq %s, %s" t ss pcs));
 						let l_or = fresh_label ctx "SWOR" in
-						emit ctx (Printf.sprintf "br %s -> %s, %s" t arm_label l_or);
+						emit ctx (Printf.sprintf "br %s -> %s, %s" swt arm_label l_or);
 						emit_label ctx l_or;
 						one_pat ps
 				in
@@ -708,26 +893,30 @@ and gen_switch ctx sw =
 				end
 		in
 		emit_tests arms;
+		let saved_full = save_live ctx in
 		let all_term = ref true in
 		List.iter (fun (arm_label, c) ->
 			emit_label ctx arm_label;
-			let snap = snapshot ctx in
+			restore_live ctx saved_full;
 			let term = gen_stmt ctx c.case_expr in
-			release_since ctx snap;
+			release_since ctx snap_all;
 			if not term then emit ctx (Printf.sprintf "jmp %s" l_end);
 			all_term := !all_term && term
 		) arms;
 		(match sw.switch_default, l_def with
 		| Some d, Some ld ->
 			emit_label ctx ld;
-			let snap = snapshot ctx in
+			restore_live ctx saved_full;
 			let term = gen_stmt ctx d in
-			release_since ctx snap;
+			release_since ctx snap_all;
 			if not term then emit ctx (Printf.sprintf "jmp %s" l_end);
 			all_term := !all_term && term
 		| _ -> ());
 		emit_label ctx l_end;
+		if arms <> [] || sw.switch_default <> None then
+			restore_live ctx (keep_oldest snap_all saved_full);
 		!all_term
+		end
 	end
 
 (* Joins the gen_operand/gen_switch `rec` chain above: switch arms,
@@ -757,6 +946,7 @@ and gen_stmt ctx e =
 			| None -> "0"
 		in
 		emit ctx (Printf.sprintf "store %s+0, %s as %s" slot valu ty);
+		track_str_len ctx v init;
 		false
 	| TReturn ret ->
 		let keep = match ret with
@@ -782,49 +972,59 @@ and gen_stmt ctx e =
 		let cs = match co with Imm s -> s | Reg r -> r in
 		let l_then = fresh_label ctx "THEN" in
 		let l_end = fresh_label ctx "ENDIF" in
+		let arm_state = save_live ctx in
 		(match else_opt with
 		| Some else_e ->
 			let l_else = fresh_label ctx "ELSE" in
 			emit ctx (Printf.sprintf "br %s -> %s, %s" cs l_then l_else);
 			let snap = snapshot ctx in
 			emit_label ctx l_then;
+			restore_live ctx arm_state;
 			let term_then = gen_stmt ctx then_e in
 			release_since ctx snap;
 			if not term_then then emit ctx (Printf.sprintf "jmp %s" l_end);
 			emit_label ctx l_else;
+			restore_live ctx arm_state;
 			let term_else = gen_stmt ctx else_e in
 			release_since ctx snap;
 			if not term_else then emit ctx (Printf.sprintf "jmp %s" l_end);
 			emit_label ctx l_end;
+			restore_live ctx arm_state;
 			term_then && term_else
 		| None ->
 			emit ctx (Printf.sprintf "br %s -> %s, %s" cs l_then l_end);
 			let snap = snapshot ctx in
 			emit_label ctx l_then;
+			restore_live ctx arm_state;
 			let term_then = gen_stmt ctx then_e in
 			release_since ctx snap;
 			if not term_then then emit ctx (Printf.sprintf "jmp %s" l_end);
 			emit_label ctx l_end;
+			restore_live ctx arm_state;
 			false)
 	| TWhile (cond, body, flag) ->
 		let l_cond = fresh_label ctx "COND" in
 		let l_body = fresh_label ctx "BODY" in
 		let l_end = fresh_label ctx "ENDWHILE" in
 		let entry_snap = snapshot ctx in
+		let saved_pre = save_live ctx in
 		let cond_snap = ref entry_snap in
+		let cond_regs = ref [] in
 		ctx.loops <- (l_end, l_cond, entry_snap, cond_snap) :: ctx.loops;
 		let emit_cond () =
 			emit_label ctx l_cond;
+			let n0 = List.length ctx.live in
 			let co = gen_operand ctx cond in
 			let cs = match co with Imm s -> s | Reg r -> r in
 			emit ctx (Printf.sprintf "br %s -> %s, %s" cs l_body l_end);
-			cond_snap := snapshot ctx
+			cond_snap := snapshot ctx;
+			cond_regs := take_live (List.length ctx.live - n0) ctx.live
 		in
 		let emit_body () =
 			emit_label ctx l_body;
-			(* Single incoming edge: drop cond temps so the bottom
-				edge matches the entry edge (live = entry_snap). *)
-			release_since ctx entry_snap;
+			(* No release here: cond temps stay live so that `break`
+				edges match the cond-false edge at the loop end.
+				Bottom/continue release everything to entry_snap. *)
 			let term = gen_stmt ctx body in
 			release_since ctx entry_snap;
 			if not term then emit ctx (Printf.sprintf "jmp %s" l_cond)
@@ -842,6 +1042,8 @@ and gen_stmt ctx e =
 			emit_cond ());
 		ctx.loops <- (match ctx.loops with _ :: rest -> rest | [] -> []);
 		emit_label ctx l_end;
+		(* Post-loop runtime live = pre-loop state + cond temps. *)
+		restore_live ctx (!cond_regs @ keep_oldest entry_snap saved_pre);
 		false
 	| TBreak -> begin
 		match ctx.loops with
@@ -877,16 +1079,17 @@ and gen_function fctx name tf ptys ret body_stmts =
 		let slot = fresh fctx "var" in
 		Hashtbl.replace fctx.vars v.v_id slot;
 		emit fctx (Printf.sprintf "%s = stack_alloc 8" slot);
-		track fctx slot;
-		emit fctx (Printf.sprintf "store %s+0, %s as %s" slot v.v_name ty)
+		emit fctx (Printf.sprintf "store %s+0, %s as %s" slot v.v_name ty);
+		(* Params are live registers too: homing copies them, the
+			originals must still be released on every exit. *)
+		track fctx v.v_name
 	) fvars;
 	let hoist = List.concat (List.map (collect_vars []) body_stmts) in
 	List.iter (fun v ->
 		if not (Hashtbl.mem fctx.vars v.v_id) then begin
 			let slot = fresh fctx "var" in
 			Hashtbl.replace fctx.vars v.v_id slot;
-			emit fctx (Printf.sprintf "%s = stack_alloc 8" slot);
-			track fctx slot
+			emit fctx (Printf.sprintf "%s = stack_alloc 8" slot)
 		end
 	) hoist;
 	let term = ref false in
@@ -936,8 +1139,17 @@ and gen_call ctx c cf args =
 			Reg r
 	end
 
-let print_type buf mt =
-	let c =
+(** Substring scan: emit `@import "sa_std/string.sa"` iff the output
+	actually EXPANDs a string macro (keeps the import graph minimal). *)
+let buf_has buf sub =
+	let s = Buffer.contents buf in
+	let ls = String.length s and lp = String.length sub in
+	let rec loop i =
+		if i + lp > ls then false
+		else String.sub s i lp = sub || loop (i + 1) in
+	loop 0
+
+let print_type buf mt =	let c =
 		match mt with
 		| TClassDecl c -> "// class " ^ (s_type_path c.cl_path)
 		| TEnumDecl e -> "// enum " ^ (s_type_path e.e_path)
@@ -958,6 +1170,7 @@ let generate com =
 		next_reg = 0; next_str = 0; next_label = 0;
 		vars = Hashtbl.create 16; live = []; loops = [];
 		emitted; funcs;
+		str_lens = Hashtbl.create 8;
 	} in
 	List.iter (print_type types) com.types;
 	let (stmts, has_args, main_class) = match com.main.main_expr with
@@ -980,13 +1193,13 @@ let generate com =
 						Hashtbl.replace emitted name ();
 						Some (name, tf, ptys, ret)
 			) c.cl_ordered_statics in
-	(* Hoist every `stack_alloc` above all branches (PhiStateConflict). *)
+	(* Hoist every `stack_alloc` above all branches (PhiStateConflict).
+		Stack slots are frame-owned: track nothing (StackEscape). *)
 	List.iter (fun v ->
 		if not (Hashtbl.mem ctx.vars v.v_id) then begin
 			let slot = fresh ctx "var" in
 			Hashtbl.replace ctx.vars v.v_id slot;
-			emit ctx (Printf.sprintf "%s = stack_alloc 8" slot);
-			track ctx slot
+			emit ctx (Printf.sprintf "%s = stack_alloc 8" slot)
 		end
 	) (List.concat (List.map (collect_vars []) stmts));
 	let main_term = ref false in
@@ -1006,7 +1219,10 @@ let generate com =
 	let ch = open_out_bin com.file in
 	output_string ch "// Generated by the Haxe SA target v0.5.\n";
 	output_string ch "// + static helpers and calls; see SA_TARGET.md.\n";
-	output_string ch "@import \"sa_std/io/print.sai\"\n\n";
+	output_string ch "@import \"sa_std/io/print.sai\"\n";
+	if buf_has body "STRING_EQ" || buf_has funcs "STRING_EQ" then
+		output_string ch "@import \"sa_std/string.sa\"\n";
+	output_string ch "\n";
 	output_string ch (Buffer.contents header);
 	output_string ch "\n";
 	output_string ch (Buffer.contents types);

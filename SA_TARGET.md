@@ -136,7 +136,11 @@ struct 20%, array 10%)。按用户指令：基础特性优先，其次 hxml，�
   (全标量签名，参数栈驻留，递归/前向调用预注册)；
   调用 `r = call` / void 裸 `call`；函数尾声按终结标志取舍
   (无不可达)；fixture Funcs (add/fact 递归) 零 TODO。
-- v0.6: class、泛型单态化、异常 `panic` → `T!`/`?`。
+- v0.6a (本提交): 字符串 `==`/`!=` + switch-on-string，
+  消费补充的 `STRING_EQ`/`STRING_NEQ` (长度前端跟踪，
+  条件 `@import "sa_std/string.sa")；单测试寄存器复用；
+  存活表路径纪律 (save/restore/keep_oldest)，Referee 全绿
+  (8 fixtures 零 TODO + `sa check` 零 trap)。
 - v0.7: hxml 工程支持 (`--sa` 与现有 `--next/--each` 批处理互通)。
 - v0.8: 宏 (`--macro`) 在 SA 目标下的求值与展开。
 - 每个版本独立提交并推送，`sa_std` 缺失先补 `sci/sa_std`。
