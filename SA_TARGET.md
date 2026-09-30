@@ -111,28 +111,28 @@ if 24%, array 21%, struct 17%, switch 10%, enum 6%)，
 `sa_plugin_sla/demos` 322 个 (arith/if/function/return ~99%,
 struct 20%, array 10%)。按用户指令：基础特性优先，其次 hxml，最后宏。
 
-- v0.1 (本提交): 平台注册 + 骨架发射 + 文档 (可编译，可出已知-good 形状)。
-- v0.2 (本提交): 常量/局部变量/`stack_alloc` 驻留 + 整数算术/比较 +
+- v0.1 : 平台注册 + 骨架发射 + 文档 (可编译，可出已知-good 形状)。
+- v0.2 : 常量/局部变量/`stack_alloc` 驻留 + 整数算术/比较 +
   bool 逻辑 + 字面量 `trace` → `@sa_print_bytes` (覆盖 function/return/arith)；
   `main_expr` 经 `entry_stmts` 解出静态 main 方法体；
   验证集 `tests/sa-demo/Arith.hx(.sa)`，`check_sa_target.py` 26/26。
-- v0.3 (本提交): `if/else` + `while`/`do-while` → `br`+`jmp` (覆盖 if 24-99%)；
+- v0.3 : `if/else` + `while`/`do-while` → `br`+`jmp` (覆盖 if 24-99%)；
   全部分支 `stack_alloc` 提升 (PhiStateConflict)，臂内临时对称释放，
   break/continue/终结追踪 (无不可达指令)，do-while+直接跳转诚实回退；
   优化器改写覆盖 (`+=`/`++`)； fixtures Flow/Arith 零 TODO，
   `tools/check_sa_shape.py` 形状自检通过。
-- v0.4a (本提交): 定长数组字面量/索引读写/`.length` + `mem_ty`
+- v0.4a : 定长数组字面量/索引读写/`.length` + `mem_ty`
   (f64/i32/ptr 三档，存取标注一致)；读形状照抄 `ARRAY_GET_U64`
   (`mul idx,8` + `ptr_add` + `load`)；布局 `[len:u64][elems×8]`；
   fixture Arr 零 TODO；`push`/增长留待 vec 宏 (v0.5)。
-- v0.4b (本提交): 匿名结构字面量 + 字段读写 (按名排序布局，
+- v0.4b : 匿名结构字面量 + 字段读写 (按名排序布局，
   声明/使用一致；类实例需构造调用，留 v0.5)；字符串值操作数
   (`&CONST` 直存)；数组元素内字段写保护性回退；
   fixtures Obj/ObjArr 零 TODO (堆对象经数组存活得到覆盖)。
 - v0.5a: `switch` → `eq`+`br` 链 (多模式或链，default，
   对称释放，终结传播)；无参 enum 构造 = tag 常量，`TEnumIndex`
   透传；字符串/guard/payload 模式诚实回退；fixture Switch 零 TODO。
-- v0.5b (本提交): 主类静态方法 → 独立 `@hx_Class_m` 函数
+- v0.5b : 主类静态方法 → 独立 `@hx_Class_m` 函数
   (全标量签名，参数栈驻留，递归/前向调用预注册)；
   调用 `r = call` / void 裸 `call`；函数尾声按终结标志取舍
   (无不可达)；fixture Funcs (add/fact 递归) 零 TODO。
@@ -145,7 +145,7 @@ struct 20%, array 10%)。按用户指令：基础特性优先，其次 hxml，�
   (fmt/concat 句柄经共享注册表 data/len/free，全既有契约；
   借用 `&pslot` 满足 print 合约；左折叠多段拼接)；
   typedef 转写透明；fixture StrFmt；9 fixture Referee 全绿。
-- v0.9 (本提交): class 实例构造 + 方法调用
+- v0.9 : class 实例构造 + 方法调用
   (可达性发射 ctor/method/static；`this` 栈驻留；
   `op=` 扩展到字段/元素；构造器经 `cl_constructor` 定位，
   对照 ts 插件 trait-downgrade 惯例)；fixture ClassHx。
@@ -153,8 +153,11 @@ struct 20%, array 10%)。按用户指令：基础特性优先，其次 hxml，�
   条件 `@import "sa_std/string.sa")；单测试寄存器复用；
   存活表路径纪律 (save/restore/keep_oldest)，Referee 全绿
   (8 fixtures 零 TODO + `sa check` 零 trap)。
-- v0.7 (本提交): hxml 工程互通 — `--sa` 走通用管线，
+- v0.7 : hxml 工程互通 — `--sa` 走通用管线，
   hxml/`--next` 批处理零代码可用 (fixture `tests/sa-demo/build.hxml`)。
-- v0.8 (本提交): 宏互通 — 宏在 Eval 上下文求值，与 codegen 无关，
+- v0.8: 宏互通 — 宏在 Eval 上下文求值，与 codegen 无关，
   零代码可用 (fixture `tests/sa-demo/Mac.hx`, expr 宏展开后正常降)。
+- v0.10 : for-in 协议 — 范围/array 由 typer 化为索引
+  while (零新增代码)，自定义迭代器走 v0.9 方法机制；
+  fixture ForLoop (三形状) 零 TODO + Referee 全绿。
 - 每个版本独立提交并推送，`sa_std` 缺失先补 `sci/sa_std`。
